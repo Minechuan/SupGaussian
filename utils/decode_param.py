@@ -47,10 +47,50 @@ def decode_param_json(json_file):
     else:
         material_params["viscosity"] = 1e-1
 
-    if "activate_para" in sim_params.keys():
-        material_params["activate_para"] = sim_params["activate_para"]
+    default_optimized_params = ["E", "nu", "mu_N", "lam_N", "viscosity"]
+    if "param" in sim_params.keys():
+        material_params["param"] = sim_params["param"]
     else:
-        material_params["activate_para"] = ["E", "mu_N", "lam_N", "viscosity"]
+        material_params["param"] = default_optimized_params
+    if not isinstance(material_params["param"], list):
+        raise TypeError("param must be a list")
+    invalid_params = [
+        name for name in material_params["param"] if name not in default_optimized_params
+    ]
+    if len(invalid_params) > 0:
+        raise TypeError(f"Undefined optimized params: {invalid_params}")
+    material_params["activate_para"] = material_params["param"]
+
+    default_parameter_clip = {
+        "E": {"lower": -1.0, "upper": 0.0},
+        "nu": {"lower": 0.05, "upper": 0.45},
+        "mu_N": {"lower": -1.0, "upper": 1.0},
+        "lam_N": {"lower": -1.0, "upper": 1.0},
+        "viscosity": {"lower": -1.0, "upper": 2.0},
+    }
+    parameter_clip = sim_params.get("parameter_clip", {})
+    material_params["parameter_clip"] = default_parameter_clip
+    for name, bounds in parameter_clip.items():
+        if name not in material_params["parameter_clip"]:
+            material_params["parameter_clip"][name] = {}
+        if "lower" in bounds:
+            material_params["parameter_clip"][name]["lower"] = bounds["lower"]
+        if "upper" in bounds:
+            material_params["parameter_clip"][name]["upper"] = bounds["upper"]
+
+    default_param_lr = {
+        "E": 0.1,
+        "nu": 0.01,
+        "mu_N": 0.1,
+        "lam_N": 0.1,
+        "viscosity": 0.1,
+    }
+    param_lr = sim_params.get("param_lr", {})
+    material_params["param_lr"] = default_param_lr
+    for name, lr in param_lr.items():
+        if name not in material_params["param_lr"]:
+            raise TypeError(f"Undefined param lr: {name}")
+        material_params["param_lr"][name] = lr
 
     if "yield_stress" in sim_params.keys():
         material_params["yield_stress"] = sim_params["yield_stress"]

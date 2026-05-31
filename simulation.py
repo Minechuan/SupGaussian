@@ -32,7 +32,7 @@ from utils.graphics_utils import focal2fov
 # MPM dependencies
 from mpm_solver_warp.engine_utils import *
 from mpm_solver_warp.mpm_solver_warp import MPM_Simulator_WARP
-from mpm_solver_warp.mpm_utils import sum_array, sum_mat33, sum_vec3, wp_clamp, update_param
+from mpm_solver_warp.mpm_utils import sum_array, sum_mat33, sum_vec3, wp_clamp, update_param, update_param_linear, set_value
 import warp as wp
 
 # Particle filling dependencies
@@ -106,6 +106,234 @@ def report_tensor_finite(name, tensor, prefix=""):
     total = tensor.numel()
     finite = int(finite_mask.sum())
     print(f"{prefix}{name}: finite={finite}/{total}")
+
+
+def render_inputs_are_safe(pos, cov3D, rot, batch, frame):
+    checks = {
+        "pos": pos,
+        "cov3D": cov3D,
+        "rot": rot,
+    }
+    for name, tensor in checks.items():
+        if not torch.isfinite(tensor).all().item():
+            cprint(
+                f"WARNING: non-finite {name} before rasterize at batch={batch}, frame={frame}.",
+                "red",
+            )
+            return False
+
+    pos_abs_max = torch.max(torch.abs(pos)).item()
+    cov_abs_max = torch.max(torch.abs(cov3D)).item()
+    rot_abs_max = torch.max(torch.abs(rot)).item()
+    if pos_abs_max > 1e4 or cov_abs_max > 1e3 or rot_abs_max > 1e3:
+        cprint(
+            f"WARNING: abnormal raster inputs at batch={batch}, frame={frame}: "
+            f"pos_abs_max={pos_abs_max}, cov_abs_max={cov_abs_max}, rot_abs_max={rot_abs_max}. "
+            "Skipping this epoch to avoid rasterizer OOM.",
+            "red",
+        )
+        return False
+    return True
+
+
+def get_parameter_clip_bounds(material_params, name):
+    bounds = material_params["parameter_clip"][name]
+    return float(bounds["lower"]), float(bounds["upper"])
+
+
+def get_nu_clip_bounds(material_params):
+    lower, upper = get_parameter_clip_bounds(material_params, "nu")
+    safe_lower = max(lower, 1e-3)
+    safe_upper = min(upper, 0.49)
+    if safe_lower != lower or safe_upper != upper:
+        cprint(
+            f"WARNING: nu clip [{lower}, {upper}] is outside the physical range. "
+            f"Using [{safe_lower}, {safe_upper}] instead.",
+            "yellow",
+        )
+    if safe_lower >= safe_upper:
+        raise ValueError(f"Invalid nu clip range after safety clamp: [{safe_lower}, {safe_upper}]")
+    return safe_lower, safe_upper
+
+
+def get_param_lr(material_params, name):
+    return float(material_params.get("param_lr", {}).get(name, 0.1))
+
+
+def should_optimize_param(material_params, name):
+    return name in material_params["param"]
+
+
+def normalize_param_grad(grad):
+    grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
+    max_grad, min_grad = torch.max(grad), torch.min(grad)
+    if max_grad - min_grad != 0:
+        return (grad - min_grad) / (max_grad - min_grad) - 0.5
+    return torch.zeros_like(grad)
+
+
+def raw_grad_is_usable(name, grad):
+    if not torch.isfinite(grad).all().item():
+        cprint(
+            f"WARNING: raw_grad_{name} contains NaN/Inf. "
+            f"Skipping {name} update this epoch to avoid parameter blow-up.",
+            "red",
+        )
+        return False
+    return True
+
+
+def get_mpm_param_arrays(mpm_solver):
+    return {
+        "E": mpm_solver.mpm_model.E,
+        "nu": mpm_solver.mpm_model.nu,
+        "mu_N": mpm_solver.mpm_model.mu_N,
+        "lam_N": mpm_solver.mpm_model.lam_N,
+        "viscosity": mpm_solver.mpm_model.viscosity,
+    }
+
+
+def snapshot_mpm_params(mpm_solver):
+    return {
+        name: wp.to_torch(param).detach().clone()
+        for name, param in get_mpm_param_arrays(mpm_solver).items()
+    }
+
+
+def restore_mpm_params(mpm_solver, snapshot, device):
+    for name, param in get_mpm_param_arrays(mpm_solver).items():
+        value = snapshot[name].to(device=device)
+        wp.launch(set_value, dim=value.shape[0], inputs=[param, wp.from_torch(value)], device=device)
+
+
+def is_zero_tensor(tensor):
+    return torch.max(torch.abs(tensor)).item() == 0.0
+
+
+def warn_if_zero_grads(title, grads, missing_grads=None):
+    if len(grads) == 0:
+        cprint(f"WARNING: no {title} gradients were selected for checking.", "yellow")
+        return
+    missing_grads = missing_grads or {}
+    missing_grad_names = [name for name, is_missing in missing_grads.items() if is_missing]
+    zero_grad_names = [name for name, grad in grads.items() if is_zero_tensor(grad)]
+    if len(missing_grad_names) > 0:
+        cprint(
+            f"WARNING: autograd returned None for {title} gradients: {missing_grad_names}. "
+            "This usually means the loss is disconnected from these tensors.",
+            "red",
+        )
+    if len(zero_grad_names) == len(grads):
+        cprint(
+            f"WARNING: all {title} gradients are zero: {zero_grad_names}. "
+            "If autograd did not return None, the graph is connected but the local derivative is numerically zero.",
+            "red",
+        )
+    elif len(zero_grad_names) > 0:
+        cprint(
+            f"WARNING: zero {title} gradients detected for: {zero_grad_names}",
+            "yellow",
+        )
+
+
+def print_tensor_autograd_diagnostics(name, tensor):
+    grad_fn_name = type(tensor.grad_fn).__name__ if tensor.grad_fn is not None else None
+    finite_count = int(torch.isfinite(tensor).sum().item())
+    total = tensor.numel()
+    abs_max = torch.max(torch.abs(torch.nan_to_num(tensor.detach()))).item()
+    print(
+        f"{name}: shape={tuple(tensor.shape)}, requires_grad={tensor.requires_grad}, "
+        f"is_leaf={tensor.is_leaf}, grad_fn={grad_fn_name}, finite={finite_count}/{total}, "
+        f"abs_max={abs_max}"
+    )
+
+
+def print_render_graph_diagnostics(loss, img_list, particle_x, particle_cov, particle_R):
+    cprint("Gradient graph diagnostics", "yellow")
+    print_tensor_autograd_diagnostics("loss", loss.reshape(1))
+    print_tensor_autograd_diagnostics("img_list", img_list)
+    print_tensor_autograd_diagnostics("particle_x", particle_x)
+    print_tensor_autograd_diagnostics("particle_cov", particle_cov)
+    print_tensor_autograd_diagnostics("particle_R", particle_R)
+
+
+def print_image_grad_diagnostics(grad_img):
+    cprint("Guidance image-gradient diagnostics", "yellow")
+    if grad_img is None:
+        cprint("WARNING: loss is disconnected from img_list; image gradient is None.", "red")
+        return
+    flat = grad_img.detach().reshape(grad_img.shape[0], -1)
+    frame_abs_mean = flat.abs().mean(dim=1)
+    frame_abs_max = flat.abs().max(dim=1).values
+    nonzero_frames = (frame_abs_max > 0.0).nonzero(as_tuple=False).flatten().tolist()
+    print(f"img_grad nonzero_frames={nonzero_frames} / {grad_img.shape[0]}")
+    print(f"img_grad frame_abs_mean={frame_abs_mean.tolist()}")
+    print(f"img_grad frame_abs_max={frame_abs_max.tolist()}")
+
+
+def print_param_clip_diagnostics(mpm_solver, material_params):
+    param_arrays = {
+        "E": mpm_solver.mpm_model.E,
+        "nu": mpm_solver.mpm_model.nu,
+        "mu_N": mpm_solver.mpm_model.mu_N,
+        "lam_N": mpm_solver.mpm_model.lam_N,
+        "viscosity": mpm_solver.mpm_model.viscosity,
+    }
+    eps = 1e-6
+    any_at_clip = False
+    cprint("MPM parameter clip diagnostics", "yellow")
+    for name in material_params["param"]:
+        param = torch.clamp(wp.to_torch(param_arrays[name]).detach(), min=1e-30)
+        value_min = torch.min(param).item()
+        value_max = torch.max(param).item()
+        total = param.numel()
+        if name == "nu":
+            lower, upper = get_nu_clip_bounds(material_params)
+            lower_count = int((param <= lower + eps).sum().item())
+            upper_count = int((param >= upper - eps).sum().item())
+            at_clip = lower_count > 0 or upper_count > 0
+            any_at_clip = any_at_clip or at_clip
+            status = "AT_CLIP" if at_clip else "not_at_clip"
+            print(
+                f"{name}: {status}, value_min={value_min}, value_max={value_max}, "
+                f"clip=[{lower}, {upper}], lower_count={lower_count}/{total}, "
+                f"upper_count={upper_count}/{total}"
+            )
+            if at_clip:
+                cprint(
+                    f"WARNING: {name} is at direct clip boundary "
+                    f"(lower {lower_count}/{total}, upper {upper_count}/{total}, "
+                    f"range=[{lower}, {upper}]).",
+                    "yellow",
+                )
+            continue
+        log_param = torch.log10(param)
+        lower, upper = get_parameter_clip_bounds(material_params, name)
+        lower_count = int((log_param <= lower + eps).sum().item())
+        upper_count = int((log_param >= upper - eps).sum().item())
+        log_min = torch.min(log_param).item()
+        log_max = torch.max(log_param).item()
+        at_clip = lower_count > 0 or upper_count > 0
+        any_at_clip = any_at_clip or at_clip
+        status = "AT_CLIP" if at_clip else "not_at_clip"
+        print(
+            f"{name}: {status}, value_min={value_min}, value_max={value_max}, "
+            f"log10_min={log_min}, log10_max={log_max}, clip=[{lower}, {upper}], "
+            f"lower_count={lower_count}/{total}, upper_count={upper_count}/{total}"
+        )
+        if lower_count > 0 or upper_count > 0:
+            cprint(
+                f"WARNING: {name} is at log10 clip boundary "
+                f"(lower {lower_count}/{total}, upper {upper_count}/{total}, "
+                f"range=[{lower}, {upper}]). Gradients may be zeroed by clipping.",
+                "yellow",
+            )
+    if not any_at_clip:
+        cprint(
+            "No optimized MPM parameter is currently at a configured clip boundary. "
+            "The zero gradient is more likely from graph disconnection or a zero local derivative.",
+            "green",
+        )
 
 
 if __name__ == "__main__":
@@ -347,6 +575,7 @@ if __name__ == "__main__":
         grid_lim=material_params["grid_lim"],
     )
     mpm_solver.set_parameters_dict(material_params)
+    last_stable_mpm_params = snapshot_mpm_params(mpm_solver)
 
     # Note: boundary conditions may depend on mass, so the order cannot be changed!
     set_boundary_conditions(mpm_solver, bc_params, time_params)
@@ -409,7 +638,6 @@ if __name__ == "__main__":
         directory_to_save = os.path.join(args.output_path, "simulation_ply")
         if not os.path.exists(directory_to_save):
             os.makedirs(directory_to_save)
-
         save_data_at_frame(
             mpm_solver,
             directory_to_save,
@@ -426,16 +654,148 @@ if __name__ == "__main__":
     shs_render = shs
     height = None
     width = None
+
+    stage_num = 4
+    frame_per_stage = 4
     
     yaml_confs = OmegaConf.load(args.guidance_config)
     yaml_confs.prompt_processor.prompt = args.prompt
+    if (
+        hasattr(yaml_confs.guidance, "low_ram_vae")
+        and yaml_confs.guidance.low_ram_vae is not None
+        and yaml_confs.guidance.low_ram_vae > 0
+        and yaml_confs.guidance.low_ram_vae < frame_per_stage
+    ):
+        cprint(
+            f"WARNING: guidance.low_ram_vae={yaml_confs.guidance.low_ram_vae} "
+            f"keeps gradients for only part of the {frame_per_stage} rendered frames. "
+            "The low-RAM VAE path now keeps gradients for the last frames deterministically.",
+            "yellow",
+        )
+    cprint("The prompt is: " + args.prompt, "yellow")
     guidance = ModelscopeGuidance(yaml_confs.guidance)
+    vae_grad_frames = frame_per_stage
+    if hasattr(yaml_confs.guidance, "low_ram_vae") and yaml_confs.guidance.low_ram_vae is not None:
+        if yaml_confs.guidance.low_ram_vae > 0:
+            vae_grad_frames = min(yaml_confs.guidance.low_ram_vae, frame_per_stage)
+    vae_grad_start_frame = frame_per_stage - vae_grad_frames
+    cprint(
+        f"VAE gradients are kept for training frames [{vae_grad_start_frame}, {frame_per_stage - 1}]",
+        "yellow",
+    )
     prompt_processor = ModelscopePromptProcessor(yaml_confs.prompt_processor)
     prompt_utils = prompt_processor()
     
-    stage_num = 8
-    frame_per_stage = 4
-    for batch in range(50):
+
+
+    '''
+    Begin
+    
+    '''
+
+
+    cprint("The initial value of the parameters", 'yellow')
+    print("E: ", torch.mean(wp.to_torch(mpm_solver.mpm_model.E)).item())
+    print("mu_N: ", torch.mean(wp.to_torch(mpm_solver.mpm_model.mu_N)).item())
+    print("lam_N: ", torch.mean(wp.to_torch(mpm_solver.mpm_model.lam_N)).item())
+    print("viscosity: ", torch.mean(wp.to_torch(mpm_solver.mpm_model.viscosity)).item())
+    cprint("The optimized MPM parameters", "yellow")
+    print(material_params["param"])
+    cprint("The clip range of the learnable MPM parameters", "yellow")
+    for param_name in ["E", "nu", "mu_N", "lam_N", "viscosity"]:
+        if param_name == "nu":
+            lower, upper = get_nu_clip_bounds(material_params)
+            print(f"{param_name}: lower={lower}, upper={upper} (direct value range)")
+        else:
+            lower, upper = get_parameter_clip_bounds(material_params, param_name)
+            print(f"{param_name}: lower={lower}, upper={upper} (log10 range)")
+    cprint("The learning rate of the learnable MPM parameters", "yellow")
+    for param_name in ["E", "nu", "mu_N", "lam_N", "viscosity"]:
+        print(f"{param_name}: lr={get_param_lr(material_params, param_name)}")
+
+    mpm_solver.finalize_mu_lam()
+    with torch.no_grad():
+        for frame in tqdm(range(stage_num * frame_per_stage)):
+            
+            current_camera = get_camera_view(
+                model_path,
+                default_camera_index=camera_params["default_camera_index"],
+                center_view_world_space=viewpoint_center_worldspace,
+                observant_coordinates=observant_coordinates,
+                show_hint=camera_params["show_hint"],
+                init_azimuthm=camera_params["init_azimuthm"],
+                init_elevation=camera_params["init_elevation"],
+                init_radius=camera_params["init_radius"],
+                move_camera=camera_params["move_camera"],
+                current_frame=frame,
+                delta_a=camera_params["delta_a"],
+                delta_e=camera_params["delta_e"],
+                delta_r=camera_params["delta_r"],
+            )
+            rasterize = initialize_resterize(
+                current_camera, gaussians, pipeline, background
+            )
+            
+            for _ in range(step_per_frame):
+                mpm_solver.p2g2p(frame, substep_dt, device=device)
+
+            pos = mpm_solver.export_particle_x_to_torch()[:gs_num].to(device)
+            cov3D = mpm_solver.export_particle_cov_to_torch()
+            rot = mpm_solver.export_particle_R_to_torch()
+            
+            cov3D = cov3D.view(-1, 6)[:gs_num].to(device)
+            rot = rot.view(-1, 3, 3)[:gs_num].to(device)
+
+            pos = pos[:init_len,:]
+            pos = apply_inverse_rotations(
+                undotransform2origin(
+                    undoshift2center111(pos), scale_origin, original_mean_pos
+                ),
+                rotation_matrices,
+            )
+            cov3D = cov3D / (scale_origin * scale_origin)
+            cov3D = apply_inverse_cov_rotations(cov3D, rotation_matrices)
+            opacity = opacity_render
+            shs = shs_render
+            if preprocessing_params["sim_area"] is not None:
+                pos = torch.cat([pos, unselected_pos], dim=0)
+                cov3D = torch.cat([cov3D, unselected_cov], dim=0)
+                opacity = torch.cat([opacity_render, unselected_opacity], dim=0)
+                shs = torch.cat([shs_render, unselected_shs], dim=0)
+            if os.path.exists(moving_pts_path):
+                pos = torch.cat([pos, unselected_pos], dim=0)
+                cov3D = torch.cat([cov3D, unselected_cov], dim=0)
+                opacity = torch.cat([opacity_render, unselected_opacity], dim=0)
+                shs = torch.cat([shs_render, unselected_shs], dim=0)
+
+            colors_precomp = convert_SH(shs, current_camera, gaussians, pos, rot)
+            rendering, raddi = rasterize(
+                means3D=pos,
+                means2D=init_screen_points,
+                shs=None,
+                colors_precomp=colors_precomp,
+                opacities=opacity,
+                scales=None,
+                rotations=None,
+                cov3D_precomp=cov3D,
+            )
+            
+            cv2_img = rendering.permute(1, 2, 0).detach().cpu().numpy()
+            cv2_img = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB)
+            if height is None or width is None:
+                height = cv2_img.shape[0] // 2 * 2
+                width = cv2_img.shape[1] // 2 * 2
+            assert args.output_path is not None
+            cv2.imwrite(
+                os.path.join(args.output_path, f"{frame}.png".rjust(8, "0")),
+                255 * cv2_img,
+            )
+    save_video(args.output_path, os.path.join(args.output_path, 'initial_render.mp4'))
+    del pos, cov3D, rot, rendering, raddi, colors_precomp, rasterize, current_camera
+    cleanup()
+
+
+    for batch in range(20):
         loss_value = 0.
         img_list = []
         tape.reset()
@@ -450,11 +810,20 @@ if __name__ == "__main__":
             )
         
         cprint(f"Solving MPM", "green")
-        for _ in range(step_per_frame * (batch % stage_num)):
+        # 并不是每次都从初始状态开始模拟，而是根据当前的batch数，先模拟一段时间，让粒子移动到不同的位置，增加训练的多样性
+        start_frame = batch % (frame_per_stage * stage_num)
+        for _ in range(step_per_frame * start_frame):
             mpm_solver.p2g2p(None, substep_dt, device=device)
         
 
         cprint(f"Rendering and computing guidance loss", "green")
+        # avg = mpm_solver.export_latest_average_stress_to_torch()
+        # print("The mean average stress of elastic is: ", torch.mean(avg['elastic']).item())
+        # print("The mean average stress of viscoelastic is: ", torch.mean(avg['viscoelastic']).item())
+        epoch_failed = False
+        particle_x = None
+        particle_cov = None
+        particle_R = None
         for frame in tqdm(range(frame_per_stage)):
             current_camera = get_camera_view(
                 model_path,
@@ -475,32 +844,53 @@ if __name__ == "__main__":
                 current_camera, gaussians, pipeline, background
             )
             
-            for _ in range(step_per_frame * (1 + stage_num) - 1):
+            # simulate to the current frame
+            for _ in range(step_per_frame):
                 mpm_solver.p2g2p(frame, substep_dt, device=device)
-            with tape:
+            
+            # rendering and compute loss
+            keep_frame_grad = frame >= vae_grad_start_frame
+            if keep_frame_grad:
+                with tape:
+                    mpm_solver.p2g2p(frame, substep_dt, device=device)
+
+                    particle_x = torch.nan_to_num(
+                        mpm_solver.export_particle_x_to_torch().to(device)
+                    )
+                    particle_cov = torch.nan_to_num(
+                        mpm_solver.export_particle_cov_to_torch().to(device)
+                    )
+                    particle_R = torch.nan_to_num(
+                        mpm_solver.export_particle_R_to_torch().to(device)
+                    )
+
+                    pos = particle_x[:gs_num]
+                    cov3D = particle_cov.view(-1, 6)[:gs_num]
+                    rot = particle_R.view(-1, 3, 3)[:gs_num]
+            else:
                 mpm_solver.p2g2p(frame, substep_dt, device=device)
-
-                particle_x = torch.nan_to_num(
-                    mpm_solver.export_particle_x_to_torch().to(device)
-                )
-                particle_cov = torch.nan_to_num(
-                    mpm_solver.export_particle_cov_to_torch().to(device)
-                )
-                particle_R = torch.nan_to_num(
-                    mpm_solver.export_particle_R_to_torch().to(device)
-                )
-
-                pos = particle_x[:gs_num]
-                cov3D = particle_cov.view(-1, 6)[:gs_num]
-                rot = particle_R.view(-1, 3, 3)[:gs_num]
+                with torch.no_grad():
+                    pos = torch.nan_to_num(
+                        mpm_solver.export_particle_x_to_torch()[:gs_num].to(device)
+                    )
+                    cov3D = torch.nan_to_num(
+                        mpm_solver.export_particle_cov_to_torch().view(-1, 6)[:gs_num].to(device)
+                    )
+                    rot = torch.nan_to_num(
+                        mpm_solver.export_particle_R_to_torch().view(-1, 3, 3)[:gs_num].to(device)
+                    )
 
             if args.debug:
-                report_tensor_finite("particle_x", particle_x, prefix=f"[batch {batch} frame {frame}] ")
-                report_tensor_finite("particle_cov", particle_cov, prefix=f"[batch {batch} frame {frame}] ")
-                report_tensor_finite("particle_R", particle_R, prefix=f"[batch {batch} frame {frame}] ")
+                # 统计其中有限的元素个数
+                if keep_frame_grad:
+                    report_tensor_finite("particle_x", particle_x, prefix=f"[batch {batch} frame {frame}] ")
+                    report_tensor_finite("particle_cov", particle_cov, prefix=f"[batch {batch} frame {frame}] ")
+                    report_tensor_finite("particle_R", particle_R, prefix=f"[batch {batch} frame {frame}] ")
 
+
+            
             pos = pos[:init_len,:]
-            pos = apply_inverse_rotations(
+            pos = apply_inverse_rotations( # 将mpm空间的粒子位置转换回原始空间，方便后续与高斯点云对齐
                 undotransform2origin(
                     undoshift2center111(pos), scale_origin, original_mean_pos
                 ),
@@ -513,30 +903,115 @@ if __name__ == "__main__":
             rot = torch.nan_to_num(rot)
             opacity = opacity_render
             shs = shs_render
+            # 
             if preprocessing_params["sim_area"] is not None:
                 pos = torch.cat([pos, unselected_pos], dim=0)
                 cov3D = torch.cat([cov3D, unselected_cov], dim=0)
                 opacity = torch.cat([opacity_render, unselected_opacity], dim=0)
                 shs = torch.cat([shs_render, unselected_shs], dim=0)
+            
+            
             if os.path.exists(moving_pts_path):
                 pos = torch.cat([pos, unselected_pos], dim=0)
                 cov3D = torch.cat([cov3D, unselected_cov], dim=0)
                 opacity = torch.cat([opacity_render, unselected_opacity], dim=0)
                 shs = torch.cat([shs_render, unselected_shs], dim=0)
 
-            colors_precomp = convert_SH(shs, current_camera, gaussians, pos, rot)
-            colors_precomp = torch.nan_to_num(colors_precomp)
-            rendering, raddi = rasterize(
-                means3D=pos,
-                means2D=pos,
-                shs=None,
-                colors_precomp=colors_precomp,
-                opacities=opacity,
-                scales=None,
-                rotations=None,
-                cov3D_precomp=cov3D,
+            if not render_inputs_are_safe(pos, cov3D, rot, batch, frame):
+                epoch_failed = True
+                break
+
+            if keep_frame_grad:
+                colors_precomp = convert_SH(shs, current_camera, gaussians, pos, rot)
+                colors_precomp = torch.nan_to_num(colors_precomp)
+                try:
+                    rendering, raddi = rasterize(
+                        means3D=pos,
+                        means2D=pos,
+                        shs=None,
+                        colors_precomp=colors_precomp,
+                        opacities=opacity,
+                        scales=None,
+                        rotations=None,
+                        cov3D_precomp=cov3D,
+                    )
+                except RuntimeError as exc:
+                    if "out of memory" not in str(exc).lower():
+                        raise
+                    cprint(
+                        f"WARNING: rasterizer OOM at batch={batch}, frame={frame}. "
+                        "Skipping this epoch and restoring the last stable parameters.",
+                        "red",
+                    )
+                    epoch_failed = True
+                    cleanup()
+                    break
+                img_list.append(rendering)
+            else:
+                with torch.no_grad():
+                    colors_precomp = convert_SH(shs, current_camera, gaussians, pos, rot)
+                    colors_precomp = torch.nan_to_num(colors_precomp)
+                    try:
+                        rendering, raddi = rasterize(
+                            means3D=pos,
+                            means2D=pos,
+                            shs=None,
+                            colors_precomp=colors_precomp,
+                            opacities=opacity,
+                            scales=None,
+                            rotations=None,
+                            cov3D_precomp=cov3D,
+                        )
+                    except RuntimeError as exc:
+                        if "out of memory" not in str(exc).lower():
+                            raise
+                        cprint(
+                            f"WARNING: rasterizer OOM at batch={batch}, frame={frame}. "
+                            "Skipping this epoch and restoring the last stable parameters.",
+                            "red",
+                        )
+                        epoch_failed = True
+                        cleanup()
+                        break
+                    img_list.append(rendering.detach())
+                del pos, cov3D, rot, rendering, raddi, colors_precomp, rasterize, current_camera
+                cleanup()
+
+        if epoch_failed or particle_x is None or particle_cov is None or particle_R is None:
+            cprint(
+                "WARNING: skipping this epoch because no safe differentiable frame was rendered. "
+                "Restoring last stable parameters and resetting MPM state.",
+                "red",
             )
-            img_list.append(rendering)
+            restore_mpm_params(mpm_solver, last_stable_mpm_params, device)
+            mpm_solver.reset_pos_from_torch(mpm_init_pos, mpm_init_vol, mpm_init_cov)
+            tape.reset()
+            del img_list
+            if "pos" in locals():
+                del pos
+            if "cov3D" in locals():
+                del cov3D
+            if "rot" in locals():
+                del rot
+            if "rasterize" in locals():
+                del rasterize
+            if "current_camera" in locals():
+                del current_camera
+            cleanup()
+            continue
+	        
+        # save image
+        path = "./tmp_imgs/"
+        if not os.path.exists(path):
+            os.makedirs(path)
+        for i in range(len(img_list)):
+            cv2_img = img_list[i].permute(1, 2, 0).detach().cpu().numpy()
+            cv2_img = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB)
+            cv2.imwrite(
+                os.path.join(path, f"{frame}_{i}.png".rjust(8, "0")),
+                255 * cv2_img,
+            )
+
         
         loss = 0.
         img_list = torch.stack(img_list) # （16,3,H, W）
@@ -546,146 +1021,255 @@ if __name__ == "__main__":
                                 torch.Tensor([camera_params['init_azimuthm']]), torch.Tensor([camera_params['init_radius']]), 
                                 rgb_as_latents=False, num_frames=frame_per_stage, train_dynamic_camera=False
                                 )
-        print(guidance_out)
+        print("The guidance output loss is: ", guidance_out['loss_sds_video'])
         for name, value in guidance_out.items():
             if name.startswith('loss_'):
                 loss += value * 3e-4
+
+        # 避免 loss 随着仿真帧数增加过大，导致梯度爆炸
+        # Normalize the loss by the number of frames in each stage
         loss = loss / stage_num
-        print(loss)
+        print("The loss is: ", loss.item())
         loss_value += loss.item()
+        if args.debug:
+            grad_img = torch.autograd.grad(
+                loss,
+                img_list,
+                retain_graph=True,
+                allow_unused=True,
+            )[0]
+            print_image_grad_diagnostics(grad_img)
         grad_x, grad_cov, grad_r = torch.autograd.grad(
             loss,
             [particle_x, particle_cov, particle_R],
             retain_graph=False,
             allow_unused=True,
         )
+        missing_state_grads = {
+            "grad_x": grad_x is None,
+            "grad_cov": grad_cov is None,
+            "grad_r": grad_r is None,
+        }
         if grad_x is None:
             grad_x = torch.zeros_like(particle_x)
         if grad_cov is None:
             grad_cov = torch.zeros_like(particle_cov)
         if grad_r is None:
             grad_r = torch.zeros_like(particle_R)
+        # The gradient of mpm
         loss_wp = wp.zeros(1, dtype=float, device=device, requires_grad=True)
+        
+        # The gradients of x
         grad_x_wp = wp.from_torch(grad_x, dtype=wp.vec3)
+        
+        # The gradients of cov are in 6D, we need to convert them to mat33
         grad_cov_wp = wp.from_torch(grad_cov)
-        grad_r_wp = wp.from_torch(grad_r.view(-1, 3, 3), dtype=wp.mat33)
-        print(torch.max(grad_x), torch.mean(grad_x))
-        wp.launch(sum_vec3, mpm_solver.n_particles, [mpm_solver.mpm_state.particle_x, grad_x_wp], [loss_wp], device=device)
-        wp.launch(sum_array, mpm_solver.n_particles*6, [mpm_solver.mpm_state.particle_cov, grad_cov_wp], [loss_wp], device=device)
-        wp.launch(sum_mat33, mpm_solver.n_particles, [mpm_solver.mpm_state.particle_R, grad_r_wp], [loss_wp], device=device)
+        grad_r_wp = wp.from_torch(grad_r.reshape(-1, 3, 3).contiguous(), dtype=wp.mat33)
+        cprint("The mean/abs/max value of the gradients: ", "yellow")
+        print("grad_x: ", torch.mean(grad_x).item(), torch.mean(torch.abs(grad_x)).item(), torch.max(torch.abs(grad_x)).item())
+        print("grad_cov: ", torch.mean(grad_cov).item(), torch.mean(torch.abs(grad_cov)).item(), torch.max(torch.abs(grad_cov)).item())
+        print("grad_r: ", torch.mean(grad_r).item(), torch.mean(torch.abs(grad_r)).item(), torch.max(torch.abs(grad_r)).item())
+        warn_if_zero_grads(
+            "render-to-MPM state",
+            {"grad_x": grad_x, "grad_cov": grad_cov, "grad_r": grad_r},
+            missing_state_grads,
+        )
+        if is_zero_tensor(grad_x) and is_zero_tensor(grad_cov) and is_zero_tensor(grad_r):
+            print_render_graph_diagnostics(loss, img_list, particle_x, particle_cov, particle_R)
+        with tape:
+            wp.launch(sum_vec3, mpm_solver.n_particles, [mpm_solver.mpm_state.particle_x, grad_x_wp], [loss_wp], device=device)
+            wp.launch(sum_array, mpm_solver.n_particles*6, [mpm_solver.mpm_state.particle_cov, grad_cov_wp], [loss_wp], device=device)
+            wp.launch(sum_mat33, mpm_solver.n_particles, [mpm_solver.mpm_state.particle_R, grad_r_wp], [loss_wp], device=device)
         tape.backward(loss=loss_wp)
-        grad = wp.to_torch(mpm_solver.mpm_model.E.grad)
-        max_grad, min_grad = torch.max(grad), torch.min(grad)
-        grad = (grad - min_grad) / (max_grad - min_grad) - 0.5 if max_grad - min_grad != 0 else torch.zeros_like(grad)
-        wp.launch(update_param, mpm_solver.n_particles, [mpm_solver.mpm_model.E, wp.from_torch(grad), 1.0, -0.4])
+        raw_grad_E = wp.to_torch(mpm_solver.mpm_model.E.grad)
+        raw_grad_nu = wp.to_torch(mpm_solver.mpm_model.nu.grad)
+        raw_grad_mu_N = wp.to_torch(mpm_solver.mpm_model.mu_N.grad)
+        raw_grad_lam_N = wp.to_torch(mpm_solver.mpm_model.lam_N.grad)
+        raw_grad_viscosity = wp.to_torch(mpm_solver.mpm_model.viscosity.grad)
+        cprint("The raw mean/abs/max value of the MPM parameter gradients: ", "yellow")
+        print("raw_grad_E: ", torch.mean(raw_grad_E).item(), torch.mean(torch.abs(raw_grad_E)).item(), torch.max(torch.abs(raw_grad_E)).item())
+        print("raw_grad_nu: ", torch.mean(raw_grad_nu).item(), torch.mean(torch.abs(raw_grad_nu)).item(), torch.max(torch.abs(raw_grad_nu)).item())
+        print("raw_grad_mu_N: ", torch.mean(raw_grad_mu_N).item(), torch.mean(torch.abs(raw_grad_mu_N)).item(), torch.max(torch.abs(raw_grad_mu_N)).item())
+        print("raw_grad_lam_N: ", torch.mean(raw_grad_lam_N).item(), torch.mean(torch.abs(raw_grad_lam_N)).item(), torch.max(torch.abs(raw_grad_lam_N)).item())
+        print("raw_grad_viscosity: ", torch.mean(raw_grad_viscosity).item(), torch.mean(torch.abs(raw_grad_viscosity)).item(), torch.max(torch.abs(raw_grad_viscosity)).item())
+        warn_if_zero_grads(
+            "raw MPM parameter",
+            {
+                name: grad
+                for name, grad in {
+                    "E": raw_grad_E,
+                    "nu": raw_grad_nu,
+                    "mu_N": raw_grad_mu_N,
+                    "lam_N": raw_grad_lam_N,
+                    "viscosity": raw_grad_viscosity,
+                }.items()
+                if should_optimize_param(material_params, name)
+            },
+        )
+        optimized_raw_grads = {
+            name: grad
+            for name, grad in {
+                "E": raw_grad_E,
+                "nu": raw_grad_nu,
+                "mu_N": raw_grad_mu_N,
+                "lam_N": raw_grad_lam_N,
+                "viscosity": raw_grad_viscosity,
+            }.items()
+            if should_optimize_param(material_params, name)
+        }
+        if len(optimized_raw_grads) > 0 and all(is_zero_tensor(grad) for grad in optimized_raw_grads.values()):
+            print_param_clip_diagnostics(mpm_solver, material_params)
+        usable_raw_grads = {
+            name: raw_grad_is_usable(name, grad)
+            for name, grad in optimized_raw_grads.items()
+        }
+        update_allowed = len(usable_raw_grads) > 0 and all(usable_raw_grads.values())
+        if len(usable_raw_grads) > 0 and not update_allowed:
+            cprint(
+                "WARNING: non-finite MPM parameter gradients detected. "
+                "Restoring the last stable MPM parameters and skipping this epoch's parameter update.",
+                "red",
+            )
+            restore_mpm_params(mpm_solver, last_stable_mpm_params, device)
+        elif update_allowed:
+            last_stable_mpm_params = snapshot_mpm_params(mpm_solver)
+
+        grad_E = raw_grad_E
+        grad_E = normalize_param_grad(grad_E)
+        E_lower, E_upper = get_parameter_clip_bounds(material_params, "E")
+        if update_allowed and should_optimize_param(material_params, "E") and usable_raw_grads.get("E", False):
+            wp.launch(update_param, mpm_solver.n_particles, [mpm_solver.mpm_model.E, wp.from_torch(grad_E), get_param_lr(material_params, "E"), E_upper, E_lower])
+
+        grad_nu = raw_grad_nu
+        grad_nu = normalize_param_grad(grad_nu)
+        nu_lower, nu_upper = get_nu_clip_bounds(material_params)
+        if update_allowed and should_optimize_param(material_params, "nu") and usable_raw_grads.get("nu", False):
+            wp.launch(update_param_linear, mpm_solver.n_particles, [mpm_solver.mpm_model.nu, wp.from_torch(grad_nu), get_param_lr(material_params, "nu"), nu_lower, nu_upper])
         
         # add
-        grad_mu_N = wp.to_torch(mpm_solver.mpm_model.mu_N.grad)
-        max_grad, min_grad = torch.max(grad_mu_N), torch.min(grad_mu_N)
-        grad_mu_N = (grad_mu_N - min_grad) / (max_grad - min_grad) - 0.5 if max_grad - min_grad != 0 else torch.zeros_like(grad_mu_N)
-        wp.launch(update_param, mpm_solver.n_particles, [mpm_solver.mpm_model.mu_N, wp.from_torch(grad_mu_N), 1.0, 1.0])
+        grad_mu_N = raw_grad_mu_N
+        grad_mu_N = normalize_param_grad(grad_mu_N)
+        mu_N_lower, mu_N_upper = get_parameter_clip_bounds(material_params, "mu_N")
+        if update_allowed and should_optimize_param(material_params, "mu_N") and usable_raw_grads.get("mu_N", False):
+            wp.launch(update_param, mpm_solver.n_particles, [mpm_solver.mpm_model.mu_N, wp.from_torch(grad_mu_N), get_param_lr(material_params, "mu_N"), mu_N_upper, mu_N_lower])
         
-        grad_lam_N = wp.to_torch(mpm_solver.mpm_model.lam_N.grad)
-        max_grad, min_grad = torch.max(grad_lam_N), torch.min(grad_lam_N)
-        grad_lam_N = (grad_lam_N - min_grad) / (max_grad - min_grad) - 0.5 if max_grad - min_grad != 0 else torch.zeros_like(grad_lam_N)
-        wp.launch(update_param, mpm_solver.n_particles, [mpm_solver.mpm_model.lam_N, wp.from_torch(grad_lam_N), 1.0, 1.0])
+        grad_lam_N = raw_grad_lam_N
+        grad_lam_N = normalize_param_grad(grad_lam_N)
+        lam_N_lower, lam_N_upper = get_parameter_clip_bounds(material_params, "lam_N")
+        if update_allowed and should_optimize_param(material_params, "lam_N") and usable_raw_grads.get("lam_N", False):
+            wp.launch(update_param, mpm_solver.n_particles, [mpm_solver.mpm_model.lam_N, wp.from_torch(grad_lam_N), get_param_lr(material_params, "lam_N"), lam_N_upper, lam_N_lower])
         
-        grad_viscosity = wp.to_torch(mpm_solver.mpm_model.viscosity.grad)
-        max_grad, min_grad = torch.max(grad_viscosity), torch.min(grad_viscosity)
-        grad_viscosity = (grad_viscosity - min_grad) / (max_grad - min_grad) - 0.5 if max_grad - min_grad != 0 else torch.zeros_like(grad_viscosity)
-        wp.launch(update_param, mpm_solver.n_particles, [mpm_solver.mpm_model.viscosity, wp.from_torch(grad_viscosity), 1.0, 2.0])
+        grad_viscosity = raw_grad_viscosity
+        grad_viscosity = normalize_param_grad(grad_viscosity)
+        viscosity_lower, viscosity_upper = get_parameter_clip_bounds(material_params, "viscosity")
+        if update_allowed and should_optimize_param(material_params, "viscosity") and usable_raw_grads.get("viscosity", False):
+            wp.launch(update_param, mpm_solver.n_particles, [mpm_solver.mpm_model.viscosity, wp.from_torch(grad_viscosity), get_param_lr(material_params, "viscosity"), viscosity_upper, viscosity_lower])
         
-        print("grad: ", torch.mean(grad), torch.max(wp.to_torch(mpm_solver.mpm_model.E.grad)), torch.min(wp.to_torch(mpm_solver.mpm_model.E.grad)))
-        print("grad_mu_N: ", torch.mean(grad_mu_N), torch.max(wp.to_torch(mpm_solver.mpm_model.mu_N.grad)), torch.min(wp.to_torch(mpm_solver.mpm_model.mu_N.grad)))
-        print("grad_lam_N: ", torch.mean(grad_lam_N))
-        print("grad_viscosity: ", torch.mean(grad_viscosity))
-        print("E: ", torch.max(wp.to_torch(mpm_solver.mpm_model.E)), torch.min(wp.to_torch(mpm_solver.mpm_model.E)), torch.mean(wp.to_torch(mpm_solver.mpm_model.E)))
-        print("mu_N: ", torch.max(wp.to_torch(mpm_solver.mpm_model.mu_N)), torch.min(wp.to_torch(mpm_solver.mpm_model.mu_N)), torch.mean(wp.to_torch(mpm_solver.mpm_model.mu_N)))
-        print("lam_N: ", torch.max(wp.to_torch(mpm_solver.mpm_model.lam_N)), torch.min(wp.to_torch(mpm_solver.mpm_model.lam_N)), torch.mean(wp.to_torch(mpm_solver.mpm_model.lam_N)))
-        print("viscosity: ", torch.max(wp.to_torch(mpm_solver.mpm_model.viscosity)), torch.min(wp.to_torch(mpm_solver.mpm_model.viscosity)), torch.mean(wp.to_torch(mpm_solver.mpm_model.viscosity)))
+
+        cprint("The mean value of the gradients: ", "yellow")
+        print("grad_E: ", torch.mean(grad_E).item())
+        print("grad_nu: ", torch.mean(grad_nu).item())
+        print("grad_mu_N: ", torch.mean(grad_mu_N).item())
+        print("grad_lam_N: ", torch.mean(grad_lam_N).item())
+        print("grad_viscosity: ", torch.mean(grad_viscosity).item())
         
+        cprint("The mean value of the parameters after update: ", "yellow")        
+        print("E: ", torch.mean(wp.to_torch(mpm_solver.mpm_model.E)).item())
+        print("nu: ", torch.mean(wp.to_torch(mpm_solver.mpm_model.nu)).item())
+        print("mu_N: ", torch.mean(wp.to_torch(mpm_solver.mpm_model.mu_N)).item())
+        print("lam_N: ", torch.mean(wp.to_torch(mpm_solver.mpm_model.lam_N)).item())
+        print("viscosity: ", torch.mean(wp.to_torch(mpm_solver.mpm_model.viscosity)).item())
+
 
         cprint(f"Updating MPM parameters", "green")
         mpm_solver.reset_pos_from_torch(mpm_init_pos, mpm_init_vol, mpm_init_cov)
         tape.reset()
+        if args.debug:
+            del grad_img
         del guidance_out, loss, img_list, loss_wp, grad_x, grad_cov, grad_r
-        del grad, grad_mu_N, grad_lam_N, grad_viscosity
-        del particle_x, particle_cov, particle_R, pos, cov3D, rot, rendering, colors_precomp, rasterize, current_camera
+        del grad_x_wp, grad_cov_wp, grad_r_wp
+        del raw_grad_E, raw_grad_nu, raw_grad_mu_N, raw_grad_lam_N, raw_grad_viscosity
+        del missing_state_grads, optimized_raw_grads, usable_raw_grads, update_allowed
+        del grad_E, grad_nu, grad_mu_N, grad_lam_N, grad_viscosity
+        del particle_x, particle_cov, particle_R, pos, cov3D, rot, rendering, raddi, colors_precomp, rasterize, current_camera
         cleanup()
         if batch % 2 == 0:
             mpm_solver.finalize_mu_lam()
-            for frame in tqdm(range(stage_num * frame_per_stage)):
-                current_camera = get_camera_view(
-                    model_path,
-                    default_camera_index=camera_params["default_camera_index"],
-                    center_view_world_space=viewpoint_center_worldspace,
-                    observant_coordinates=observant_coordinates,
-                    show_hint=camera_params["show_hint"],
-                    init_azimuthm=camera_params["init_azimuthm"],
-                    init_elevation=camera_params["init_elevation"],
-                    init_radius=camera_params["init_radius"],
-                    move_camera=camera_params["move_camera"],
-                    current_frame=frame,
-                    delta_a=camera_params["delta_a"],
-                    delta_e=camera_params["delta_e"],
-                    delta_r=camera_params["delta_r"],
-                )
-                rasterize = initialize_resterize(
-                    current_camera, gaussians, pipeline, background
-                )
-                
-                for _ in range(step_per_frame):
-                    mpm_solver.p2g2p(frame, substep_dt, device=device)
+            with torch.no_grad():
+                for frame in tqdm(range(stage_num * frame_per_stage)):
+                    current_camera = get_camera_view(
+                        model_path,
+                        default_camera_index=camera_params["default_camera_index"],
+                        center_view_world_space=viewpoint_center_worldspace,
+                        observant_coordinates=observant_coordinates,
+                        show_hint=camera_params["show_hint"],
+                        init_azimuthm=camera_params["init_azimuthm"],
+                        init_elevation=camera_params["init_elevation"],
+                        init_radius=camera_params["init_radius"],
+                        move_camera=camera_params["move_camera"],
+                        current_frame=frame,
+                        delta_a=camera_params["delta_a"],
+                        delta_e=camera_params["delta_e"],
+                        delta_r=camera_params["delta_r"],
+                    )
+                    rasterize = initialize_resterize(
+                        current_camera, gaussians, pipeline, background
+                    )
+                    
+                    for _ in range(step_per_frame):
+                        mpm_solver.p2g2p(frame, substep_dt, device=device)
 
-                pos = mpm_solver.export_particle_x_to_torch()[:gs_num].to(device)
-                cov3D = mpm_solver.export_particle_cov_to_torch()
-                rot = mpm_solver.export_particle_R_to_torch()
-                
-                cov3D = cov3D.view(-1, 6)[:gs_num].to(device)
-                rot = rot.view(-1, 3, 3)[:gs_num].to(device)
+                    pos = mpm_solver.export_particle_x_to_torch()[:gs_num].to(device)
+                    cov3D = mpm_solver.export_particle_cov_to_torch()
+                    rot = mpm_solver.export_particle_R_to_torch()
+                    
+                    cov3D = cov3D.view(-1, 6)[:gs_num].to(device)
+                    rot = rot.view(-1, 3, 3)[:gs_num].to(device)
 
-                pos = pos[:init_len,:]
-                pos = apply_inverse_rotations(
-                    undotransform2origin(
-                        undoshift2center111(pos), scale_origin, original_mean_pos
-                    ),
-                    rotation_matrices,
-                )
-                cov3D = cov3D / (scale_origin * scale_origin)
-                cov3D = apply_inverse_cov_rotations(cov3D, rotation_matrices)
-                opacity = opacity_render
-                shs = shs_render
-                if preprocessing_params["sim_area"] is not None:
-                    pos = torch.cat([pos, unselected_pos], dim=0)
-                    cov3D = torch.cat([cov3D, unselected_cov], dim=0)
-                    opacity = torch.cat([opacity_render, unselected_opacity], dim=0)
-                    shs = torch.cat([shs_render, unselected_shs], dim=0)
-                if os.path.exists(moving_pts_path):
-                    pos = torch.cat([pos, unselected_pos], dim=0)
-                    cov3D = torch.cat([cov3D, unselected_cov], dim=0)
-                    opacity = torch.cat([opacity_render, unselected_opacity], dim=0)
-                    shs = torch.cat([shs_render, unselected_shs], dim=0)
+                    pos = pos[:init_len,:]
+                    pos = apply_inverse_rotations(
+                        undotransform2origin(
+                            undoshift2center111(pos), scale_origin, original_mean_pos
+                        ),
+                        rotation_matrices,
+                    )
+                    cov3D = cov3D / (scale_origin * scale_origin)
+                    cov3D = apply_inverse_cov_rotations(cov3D, rotation_matrices)
+                    opacity = opacity_render
+                    shs = shs_render
+                    if preprocessing_params["sim_area"] is not None:
+                        pos = torch.cat([pos, unselected_pos], dim=0)
+                        cov3D = torch.cat([cov3D, unselected_cov], dim=0)
+                        opacity = torch.cat([opacity_render, unselected_opacity], dim=0)
+                        shs = torch.cat([shs_render, unselected_shs], dim=0)
+                    if os.path.exists(moving_pts_path):
+                        pos = torch.cat([pos, unselected_pos], dim=0)
+                        cov3D = torch.cat([cov3D, unselected_cov], dim=0)
+                        opacity = torch.cat([opacity_render, unselected_opacity], dim=0)
+                        shs = torch.cat([shs_render, unselected_shs], dim=0)
 
-                colors_precomp = convert_SH(shs, current_camera, gaussians, pos, rot)
-                rendering, raddi = rasterize(
-                    means3D=pos,
-                    means2D=init_screen_points,
-                    shs=None,
-                    colors_precomp=colors_precomp,
-                    opacities=opacity,
-                    scales=None,
-                    rotations=None,
-                    cov3D_precomp=cov3D,
-                )
-                
-                cv2_img = rendering.permute(1, 2, 0).detach().cpu().numpy()
-                cv2_img = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB)
-                if height is None or width is None:
-                    height = cv2_img.shape[0] // 2 * 2
-                    width = cv2_img.shape[1] // 2 * 2
-                assert args.output_path is not None
-                cv2.imwrite(
-                    os.path.join(args.output_path, f"{frame}.png".rjust(8, "0")),
-                    255 * cv2_img,
-                )
+                    colors_precomp = convert_SH(shs, current_camera, gaussians, pos, rot)
+                    rendering, raddi = rasterize(
+                        means3D=pos,
+                        means2D=init_screen_points,
+                        shs=None,
+                        colors_precomp=colors_precomp,
+                        opacities=opacity,
+                        scales=None,
+                        rotations=None,
+                        cov3D_precomp=cov3D,
+                    )
+                    
+                    cv2_img = rendering.permute(1, 2, 0).detach().cpu().numpy()
+                    cv2_img = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB)
+                    if height is None or width is None:
+                        height = cv2_img.shape[0] // 2 * 2
+                        width = cv2_img.shape[1] // 2 * 2
+                    assert args.output_path is not None
+                    cv2.imwrite(
+                        os.path.join(args.output_path, f"{frame}.png".rjust(8, "0")),
+                        255 * cv2_img,
+                    )
             save_video(args.output_path, os.path.join(args.output_path, 'video%02d.mp4' % batch))
+            del pos, cov3D, rot, rendering, raddi, colors_precomp, rasterize, current_camera
+            cleanup()

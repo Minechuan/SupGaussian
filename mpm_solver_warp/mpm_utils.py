@@ -529,34 +529,40 @@ def compute_stress_from_F_trial(
         U = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         V = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         sig = wp.vec3(0.0)
-        stress = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        elastic_stress = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        viscoelastic_stress = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         wp.svd3(state.particle_F[p], U, sig, V)
         # add
         if model.material == 0:
-            stress = kirchoff_stress_FCR(
+            elastic_stress = kirchoff_stress_FCR(
                 state.particle_F[p], U, V, J, model.mu[p], model.lam[p]
             )
             tau_N = 2.0 * model.mu_N[p] * epsilon_N + model.lam_N[p] * trace_epsilon_trial_vec
-            stress = stress + U_N * wp.diag(tau_N) * wp.transpose(V_N)
+            viscoelastic_stress = U_N * wp.diag(tau_N) * wp.transpose(V_N)
         if model.material == 5:
-            stress = kirchoff_stress_FCR(
+            elastic_stress = kirchoff_stress_FCR(
                 state.particle_F[p], U, V, J, model.mu[p], model.lam[p]
             )
         if model.material == 1:
-            stress = kirchoff_stress_StVK(
+            elastic_stress = kirchoff_stress_StVK(
                 state.particle_F[p], U, V, sig, model.mu[p], model.lam[p]
             )
         if model.material == 2:
-            stress = kirchoff_stress_drucker_prager(
+            elastic_stress = kirchoff_stress_drucker_prager(
                 state.particle_F[p], U, V, sig, model.mu[p], model.lam[p]
             )
         if model.material == 3:
             # temporarily use stvk, subject to change
-            stress = kirchoff_stress_StVK(
+            elastic_stress = kirchoff_stress_StVK(
                 state.particle_F[p], U, V, sig, model.mu[p], model.lam[p]
             )
 
+        stress = elastic_stress + viscoelastic_stress
+        elastic_stress = (elastic_stress + wp.transpose(elastic_stress)) / 2.0
+        viscoelastic_stress = (viscoelastic_stress + wp.transpose(viscoelastic_stress)) / 2.0
         stress = (stress + wp.transpose(stress)) / 2.0  # enfore symmetry
+        state.particle_elastic_stress[p] = elastic_stress
+        state.particle_viscoelastic_stress[p] = viscoelastic_stress
         state.particle_stress[p] = stress
 
 
@@ -722,9 +728,27 @@ def wp_clamp(x, min, max):
     
     
 @wp.kernel()
-def update_param(param: wp.array(dtype=float), grad: wp.array(dtype=float), lr: float, upper: float = -0.4):
+def update_param(
+    param: wp.array(dtype=float),
+    grad: wp.array(dtype=float),
+    lr: float,
+    upper: float = -0.4,
+    lower: float = -1.0,
+):
     tid = wp.tid()
     log_param = wp.log10(param[tid])
     log_param -= grad[tid] * lr
-    log_param = wp.clamp(log_param, -1., upper)
+    log_param = wp.clamp(log_param, lower, upper)
     param[tid] = wp.pow(10., log_param)
+
+
+@wp.kernel()
+def update_param_linear(
+    param: wp.array(dtype=float),
+    grad: wp.array(dtype=float),
+    lr: float,
+    lower: float,
+    upper: float,
+):
+    tid = wp.tid()
+    param[tid] = wp.clamp(param[tid] - grad[tid] * lr, lower, upper)

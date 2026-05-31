@@ -44,4 +44,4 @@ guidance:
 
   view_dependent_prompting: True
 
-  low_ram_vae: 1 ## set to a positive integer (the number of frames with gradient) if hope to use this
+  low_ram_vae: 0 ## set to a positive integer (the number of frames with gradient) if hope to use this

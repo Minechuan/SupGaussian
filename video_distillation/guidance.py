@@ -127,18 +127,22 @@ class ModelscopeGuidance:
             imgs = imgs * 2.0 - 1.0
 
         if self.cfg.low_ram_vae > 0:
-            vnum = self.cfg.low_ram_vae
-            mask_vae = torch.randperm(imgs.shape[0]) < vnum
-            with torch.no_grad():
-                posterior_mask = torch.cat(
-                    [
-                        self.vae.encode(
-                            imgs[~mask_vae][i : i + 1].to(self.weights_dtype)
-                        ).latent_dist.sample()
-                        for i in range(imgs.shape[0] - vnum)
-                    ],
-                    dim=0,
-                )
+            vnum = min(self.cfg.low_ram_vae, imgs.shape[0])
+            mask_vae = torch.zeros(imgs.shape[0], dtype=torch.bool, device=imgs.device)
+            mask_vae[-vnum:] = True
+            if imgs.shape[0] > vnum:
+                with torch.no_grad():
+                    posterior_mask = torch.cat(
+                        [
+                            self.vae.encode(
+                                imgs[~mask_vae][i : i + 1].to(self.weights_dtype)
+                            ).latent_dist.sample()
+                            for i in range(imgs.shape[0] - vnum)
+                        ],
+                        dim=0,
+                    )
+            else:
+                posterior_mask = None
             posterior = torch.cat(
                 [
                     self.vae.encode(
@@ -154,7 +158,8 @@ class ModelscopeGuidance:
                 device=posterior.device,
                 dtype=posterior.dtype,
             )
-            posterior_full[~mask_vae] = posterior_mask
+            if posterior_mask is not None:
+                posterior_full[~mask_vae] = posterior_mask
             posterior_full[mask_vae] = posterior
             latents = posterior_full * self.vae.config.scaling_factor
         else:

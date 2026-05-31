@@ -59,6 +59,8 @@ class MPMStateStruct:
     particle_F_N_trial: wp.array(dtype=wp.mat33)
     particle_R: wp.array(dtype=wp.mat33)  # rotation matrix
     particle_stress: wp.array(dtype=wp.mat33)  # Kirchoff stress, elastic stress
+    particle_elastic_stress: wp.array(dtype=wp.mat33)
+    particle_viscoelastic_stress: wp.array(dtype=wp.mat33)
     particle_C: wp.array(dtype=wp.mat33)
     particle_vol: wp.array(dtype=float)  # current volume
     particle_mass: wp.array(dtype=float)  # mass

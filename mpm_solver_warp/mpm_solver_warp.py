@@ -101,6 +101,12 @@ class MPM_Simulator_WARP:
         self.mpm_state.particle_stress = wp.zeros(
             shape=n_particles, dtype=wp.mat33, device=device, requires_grad=True
         )
+        self.mpm_state.particle_elastic_stress = wp.zeros(
+            shape=n_particles, dtype=wp.mat33, device=device, requires_grad=True
+        )
+        self.mpm_state.particle_viscoelastic_stress = wp.zeros(
+            shape=n_particles, dtype=wp.mat33, device=device, requires_grad=True
+        )
 
         self.mpm_state.particle_vol = wp.zeros(
             shape=n_particles, dtype=float, device=device, requires_grad=True
@@ -690,6 +696,22 @@ class MPM_Simulator_WARP:
         C_tensor = wp.to_torch(self.mpm_state.particle_C)
         C_tensor = C_tensor.reshape(-1, 9)
         return C_tensor
+
+    def export_latest_average_stress_to_torch(self):
+        elastic_stress = wp.to_torch(self.mpm_state.particle_elastic_stress)
+        viscoelastic_stress = wp.to_torch(self.mpm_state.particle_viscoelastic_stress)
+        return {
+            "elastic": elastic_stress.reshape(-1, 3, 3).mean(dim=0),
+            "viscoelastic": viscoelastic_stress.reshape(-1, 3, 3).mean(dim=0),
+        }
+
+    def print_latest_average_stress(self):
+        avg_stress = self.export_latest_average_stress_to_torch()
+        print("Latest average elastic stress:")
+        print(avg_stress["elastic"])
+        print("Latest average viscoelastic stress:")
+        print(avg_stress["viscoelastic"])
+        return avg_stress
 
     def export_particle_cov_to_torch(self, device="cuda:0"):
         if not self.mpm_model.update_cov_with_F:

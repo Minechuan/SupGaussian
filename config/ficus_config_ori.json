@@ -5,18 +5,11 @@
     "substep_dt": 1e-4,
     "frame_dt": 4e-2,
     "frame_num": 125,
-    "nu": 0.2,
-    "E": 1,
+    "nu": 0.4,
+    "E": 2e6,
     "mu_N": 2,
     "lam_N": 1,
     "viscosity": 10,
-        "parameter_clip": {
-        "E": {"lower": -1.0, "upper": 2.0}, 
-        "nu": {"lower": -1.0, "upper": 0.3},
-        "mu_N": {"lower": -1.0, "upper": 5.0},
-        "lam_N": {"lower": -1.0, "upper": 5.0}
-    },
-    "param": ["E", "nu", "viscosity"],
     "material": "jelly",
     "density": 200,
     "g": [0,0,0],
@@ -28,12 +21,12 @@
             "point": [
                 1,
                 1,
-                0.005
+                0.5
             ],
             "size": [
                 0.5,
                 0.5,
-                0.005
+                0.28
             ],
             "velocity": [
                 0,
@@ -53,6 +46,23 @@
             ],
             "num_dt": 1,
             "start_time": 0
+        }
+    ],
+    "additional_material_params": [
+        {
+            "point": [
+                1.0,
+                1.0,
+                1.5
+            ],
+            "size": [
+                1.0,
+                1.0,
+                0.5
+            ],
+            "nu": 0.4,
+            "E": 2e6,
+            "density": 70
         }
     ],
     "mpm_space_vertical_upward_axis": [0,0,1],
