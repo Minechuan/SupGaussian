@@ -5,7 +5,7 @@ prompt_processor:
   prompt_back: null
   prompt_overhead: null
 
-  pretrained_model_name_or_path: "./text-to-video-ms-1.7b"
+  pretrained_model_name_or_path: "/home/featurize/work/models"
   overhead_threshold: 60.0
   front_threshold: 45.0
   back_threshold: 45.0
@@ -24,7 +24,7 @@ prompt_processor:
   prompt_debiasing_mask_ids: null
 
 guidance:
-  pretrained_model_name_or_path: "./text-to-video-ms-1.7b"
+  pretrained_model_name_or_path: "/home/featurize/work/models"
   enable_memory_efficient_attention: False
   enable_sequential_cpu_offload: True
   enable_attention_slicing: True
@@ -45,3 +45,8 @@ guidance:
   view_dependent_prompting: True
 
   low_ram_vae: 0 ## set to a positive integer (the number of frames with gradient) if hope to use this
+
+cluster:
+  k: 4
+  seed: 0
+  max_iter: 20

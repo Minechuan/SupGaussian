@@ -50,10 +50,18 @@ def initialize_resterize(
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
         debug=pipe.debug,
+        antialiasing=getattr(pipe, "antialiasing", False),
     )
 
     rasterize = GaussianRasterizer(raster_settings=raster_settings)
     return rasterize
+
+
+def rasterize_render_and_radii(rasterize, **kwargs):
+    output = rasterize(**kwargs)
+    if not isinstance(output, (tuple, list)) or len(output) < 2:
+        raise ValueError("Unexpected rasterizer output format.")
+    return output[0], output[1]
 
 
 def load_params_from_gs(

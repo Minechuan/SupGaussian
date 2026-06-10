@@ -63,6 +63,7 @@ class PipelineParamsNoparse:
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
         self.debug = False
+        self.antialiasing = False
 
 
 def load_checkpoint(model_path, iteration=-1):
@@ -85,6 +86,260 @@ def load_checkpoint(model_path, iteration=-1):
     gaussians = GaussianModel(sh_degree)
     gaussians.load_ply(checkpt_path)
     return gaussians
+
+
+def cfg_get(cfg, key, default=None):
+    if cfg is None:
+        return default
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    if hasattr(cfg, key):
+        return getattr(cfg, key)
+    try:
+        return cfg[key]
+    except Exception:
+        return default
+
+
+def get_cluster_config(yaml_confs):
+    cluster_cfg = cfg_get(yaml_confs, "cluster", None)
+    k = cfg_get(cluster_cfg, "k", cfg_get(cluster_cfg, "num_clusters", None))
+    if k is None:
+        k = cfg_get(yaml_confs, "cluster_k", 1)
+    seed = cfg_get(cluster_cfg, "seed", cfg_get(yaml_confs, "cluster_seed", 0))
+    max_iter = cfg_get(cluster_cfg, "max_iter", cfg_get(cluster_cfg, "iter", 20))
+    return max(1, int(k)), int(seed), max(1, int(max_iter))
+
+
+def extract_cluster_features(shs: torch.Tensor) -> torch.Tensor:
+    if shs.ndim == 3 and shs.shape[1] >= 1 and shs.shape[2] == 3:
+        colors = shs[:, 0, :]
+    else:
+        flat = shs.reshape(shs.shape[0], -1)
+        colors = flat[:, :3]
+
+    colors = colors.float()
+    colors = colors - colors.min(dim=0, keepdim=True).values
+    colors = colors / (
+        colors.max(dim=0, keepdim=True).values
+        - colors.min(dim=0, keepdim=True).values
+        + 1e-6
+    )
+    return colors.clamp(0.0, 1.0)
+
+
+def run_kmeans(features: torch.Tensor, num_clusters: int, max_iter: int = 20, seed: int = 0):
+    features = features.detach()
+    num_clusters = max(1, min(num_clusters, features.shape[0]))
+    generator = torch.Generator(device=features.device)
+    generator.manual_seed(seed)
+    init_idx = torch.randperm(
+        features.shape[0], generator=generator, device=features.device
+    )[:num_clusters]
+    centers = features[init_idx].clone()
+
+    labels = torch.zeros(features.shape[0], dtype=torch.long, device=features.device)
+    for _ in range(max_iter):
+        dist = torch.cdist(features, centers)
+        new_labels = torch.argmin(dist, dim=1)
+
+        new_centers = []
+        for cluster_id in range(num_clusters):
+            mask = new_labels == cluster_id
+            if mask.any():
+                new_centers.append(features[mask].mean(dim=0))
+            else:
+                new_centers.append(centers[cluster_id])
+        new_centers = torch.stack(new_centers, dim=0)
+
+        if torch.equal(new_labels, labels):
+            centers = new_centers
+            break
+
+        labels = new_labels
+        centers = new_centers
+
+    return labels, centers
+
+
+def assign_clusters_to_filled_particles(
+    reference_pos: torch.Tensor,
+    reference_labels: torch.Tensor,
+    query_pos: torch.Tensor,
+):
+    if query_pos.numel() == 0:
+        return torch.empty((0,), dtype=torch.long, device=reference_labels.device)
+
+    try:
+        from scipy.spatial import cKDTree
+
+        tree = cKDTree(reference_pos.detach().cpu().numpy())
+        _, nearest = tree.query(query_pos.detach().cpu().numpy(), k=1)
+        nearest = torch.as_tensor(nearest, dtype=torch.long, device=reference_labels.device)
+        return reference_labels[nearest]
+    except Exception:
+        batch_size = 4096
+        out = []
+        reference_pos = reference_pos.to(query_pos.device)
+        for start in range(0, query_pos.shape[0], batch_size):
+            end = min(start + batch_size, query_pos.shape[0])
+            dist = torch.cdist(query_pos[start:end], reference_pos)
+            nearest = torch.argmin(dist, dim=1)
+            out.append(reference_labels[nearest].to(reference_labels.device))
+        return torch.cat(out, dim=0)
+
+
+def build_cluster_params(material_params: dict, num_clusters: int, device: str):
+    return {
+        name: torch.full(
+            (num_clusters,),
+            float(material_params[name]),
+            device=device,
+            dtype=torch.float32,
+        )
+        for name in ["E", "nu", "mu_N", "lam_N", "viscosity"]
+    }
+
+
+def snapshot_cluster_params(cluster_params: dict):
+    return {name: value.detach().clone() for name, value in cluster_params.items()}
+
+
+def restore_cluster_params(cluster_params: dict, snapshot: dict):
+    for name, value in snapshot.items():
+        cluster_params[name] = value.detach().clone()
+
+
+def broadcast_cluster_params(mpm_solver, cluster_params: dict, cluster_ids: torch.Tensor, device: str):
+    for name, param in get_mpm_param_arrays(mpm_solver).items():
+        values = cluster_params[name][cluster_ids].contiguous().to(device=device)
+        wp.launch(
+            set_value,
+            dim=values.shape[0],
+            inputs=[param, wp.from_torch(values)],
+            device=device,
+        )
+
+
+def aggregate_cluster_grad(grad: torch.Tensor, cluster_ids: torch.Tensor, num_clusters: int):
+    if grad is None:
+        return torch.zeros((num_clusters,), device=cluster_ids.device)
+
+    grad = torch.nan_to_num(grad.detach().reshape(-1), nan=0.0, posinf=0.0, neginf=0.0)
+    cluster_ids = cluster_ids.long().to(device=grad.device)
+    cluster_grad = torch.zeros((num_clusters,), device=grad.device, dtype=grad.dtype)
+    cluster_count = torch.zeros((num_clusters,), device=grad.device, dtype=grad.dtype)
+    cluster_grad.scatter_add_(0, cluster_ids, grad)
+    cluster_count.scatter_add_(0, cluster_ids, torch.ones_like(grad))
+    return cluster_grad / cluster_count.clamp_min(1.0)
+
+
+def update_cluster_param(material_params, cluster_params, name, cluster_grad):
+    if not should_optimize_param(material_params, name):
+        return
+
+    grad = normalize_param_grad(cluster_grad)
+    lr = get_param_lr(material_params, name)
+    if name == "nu":
+        lower, upper = get_nu_clip_bounds(material_params)
+        cluster_params[name] = torch.clamp(cluster_params[name] - grad * lr, lower, upper)
+    else:
+        lower, upper = get_parameter_clip_bounds(material_params, name)
+        log_param = torch.log10(cluster_params[name].clamp_min(1e-30))
+        log_param = torch.clamp(log_param - grad * lr, lower, upper)
+        cluster_params[name] = torch.pow(
+            torch.tensor(10.0, device=cluster_params[name].device, dtype=cluster_params[name].dtype),
+            log_param,
+        )
+
+
+def print_cluster_summary(cluster_params: dict, material_params: dict):
+    cprint("Cluster MPM parameters", "yellow")
+    for idx in range(cluster_params["E"].shape[0]):
+        values = {
+            name: float(cluster_params[name][idx].item())
+            for name in ["E", "nu", "mu_N", "lam_N", "viscosity"]
+        }
+        print(
+            f"cluster {idx}: "
+            f"E={values['E']:.6g}, nu={values['nu']:.6g}, "
+            f"mu_N={values['mu_N']:.6g}, lam_N={values['lam_N']:.6g}, "
+            f"viscosity={values['viscosity']:.6g}"
+        )
+
+
+def cluster_palette_tensor(device, dtype):
+    palette = torch.tensor(
+        [
+            [230, 25, 75],
+            [60, 180, 75],
+            [255, 225, 25],
+            [0, 130, 200],
+            [245, 130, 48],
+            [145, 30, 180],
+            [70, 240, 240],
+            [240, 50, 230],
+            [210, 245, 60],
+            [250, 190, 190],
+            [0, 128, 128],
+            [230, 190, 255],
+            [170, 110, 40],
+            [255, 250, 200],
+            [128, 0, 0],
+            [170, 255, 195],
+            [128, 128, 0],
+            [255, 215, 180],
+            [0, 0, 128],
+            [128, 128, 128],
+        ],
+        device=device,
+        dtype=dtype,
+    ) / 255.0
+    return palette
+
+
+def build_cluster_mask_colors(num_points: int, cluster_ids: torch.Tensor, device, dtype):
+    colors = torch.full((num_points, 3), 0.5, device=device, dtype=dtype)
+    label_count = min(num_points, int(cluster_ids.numel()))
+    if label_count == 0:
+        return colors
+    palette = cluster_palette_tensor(device, dtype)
+    labels = cluster_ids[:label_count].to(device=device, dtype=torch.long)
+    colors[:label_count] = palette[labels % palette.shape[0]]
+    return colors
+
+
+def render_cluster_mask_image(
+    rasterize,
+    pos,
+    opacity,
+    cov3D,
+    cluster_ids,
+):
+    mask_colors = build_cluster_mask_colors(
+        pos.shape[0],
+        cluster_ids,
+        device=pos.device,
+        dtype=pos.dtype,
+    )
+    rendering, _ = rasterize_render_and_radii(
+        rasterize,
+        means3D=pos,
+        means2D=torch.zeros_like(pos, dtype=pos.dtype, requires_grad=False, device=pos.device),
+        shs=None,
+        colors_precomp=mask_colors,
+        opacities=opacity,
+        scales=None,
+        rotations=None,
+        cov3D_precomp=cov3D,
+    )
+    return rendering
+
+
+def save_tensor_image_bgr(image: torch.Tensor, filename: str):
+    cv2_img = image.permute(1, 2, 0).detach().cpu().numpy()
+    cv2_img = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB)
+    cv2.imwrite(filename, 255 * cv2_img)
 
 
 def report_particle_bounds(mpm_solver, grid_lim, prefix=""):
@@ -367,6 +622,8 @@ if __name__ == "__main__":
         preprocessing_params,
         camera_params,
     ) = decode_param_json(args.physics_config)
+    yaml_confs = OmegaConf.load(args.guidance_config)
+    cluster_k, cluster_seed, cluster_iter = get_cluster_config(yaml_confs)
 
     # load gaussians
     print("Loading gaussians...")
@@ -474,6 +731,28 @@ if __name__ == "__main__":
             "./log/transformed_particles.ply",
         )
 
+    color_features = extract_cluster_features(init_shs)
+    cluster_ids, cluster_centers = run_kmeans(
+        color_features,
+        cluster_k,
+        max_iter=cluster_iter,
+        seed=cluster_seed,
+    )
+    cluster_k = int(cluster_centers.shape[0])
+    cprint(
+        f"Clustered {transformed_pos.shape[0]} optimized Gaussians into {cluster_k} color clusters.",
+        "yellow",
+    )
+    if args.output_path is not None:
+        np.save(
+            os.path.join(args.output_path, "cluster_ids_original.npy"),
+            cluster_ids.detach().cpu().numpy(),
+        )
+        np.save(
+            os.path.join(args.output_path, "cluster_centers.npy"),
+            cluster_centers.detach().cpu().numpy(),
+        )
+
     # fill particles if needed
     gs_num = transformed_pos.shape[0]
     device = "cuda:0"
@@ -501,6 +780,17 @@ if __name__ == "__main__":
             particle_position_tensor_to_ply(mpm_init_pos, "./log/filled_particles.ply")
     else:
         mpm_init_pos = transformed_pos.to(device=device)
+
+    if mpm_init_pos.shape[0] > gs_num:
+        filled_cluster_ids = assign_clusters_to_filled_particles(
+            transformed_pos,
+            cluster_ids,
+            mpm_init_pos[gs_num:],
+        )
+        mpm_cluster_ids = torch.cat([cluster_ids, filled_cluster_ids], dim=0)
+    else:
+        mpm_cluster_ids = cluster_ids
+    mpm_cluster_ids = mpm_cluster_ids.to(device=device, dtype=torch.long)
 
     # densify for high-frequency elastic objects
     init_len = mpm_init_pos.shape[0]
@@ -575,7 +865,9 @@ if __name__ == "__main__":
         grid_lim=material_params["grid_lim"],
     )
     mpm_solver.set_parameters_dict(material_params)
-    last_stable_mpm_params = snapshot_mpm_params(mpm_solver)
+    cluster_params = build_cluster_params(material_params, cluster_k, device)
+    broadcast_cluster_params(mpm_solver, cluster_params, mpm_cluster_ids, device)
+    last_stable_cluster_params = snapshot_cluster_params(cluster_params)
 
     # Note: boundary conditions may depend on mass, so the order cannot be changed!
     set_boundary_conditions(mpm_solver, bc_params, time_params)
@@ -654,11 +946,14 @@ if __name__ == "__main__":
     shs_render = shs
     height = None
     width = None
+    cluster_mask_dir = None
+    if args.output_path is not None:
+        cluster_mask_dir = os.path.join(args.output_path, "cluster_masks")
+        os.makedirs(cluster_mask_dir, exist_ok=True)
 
     stage_num = 4
-    frame_per_stage = 4
+    frame_per_stage = 16
     
-    yaml_confs = OmegaConf.load(args.guidance_config)
     yaml_confs.prompt_processor.prompt = args.prompt
     if (
         hasattr(yaml_confs.guidance, "low_ram_vae")
@@ -712,7 +1007,9 @@ if __name__ == "__main__":
     cprint("The learning rate of the learnable MPM parameters", "yellow")
     for param_name in ["E", "nu", "mu_N", "lam_N", "viscosity"]:
         print(f"{param_name}: lr={get_param_lr(material_params, param_name)}")
+    print_cluster_summary(cluster_params, material_params)
 
+    broadcast_cluster_params(mpm_solver, cluster_params, mpm_cluster_ids, device)
     mpm_solver.finalize_mu_lam()
     with torch.no_grad():
         for frame in tqdm(range(stage_num * frame_per_stage)):
@@ -769,7 +1066,8 @@ if __name__ == "__main__":
                 shs = torch.cat([shs_render, unselected_shs], dim=0)
 
             colors_precomp = convert_SH(shs, current_camera, gaussians, pos, rot)
-            rendering, raddi = rasterize(
+            rendering, raddi = rasterize_render_and_radii(
+                rasterize,
                 means3D=pos,
                 means2D=init_screen_points,
                 shs=None,
@@ -790,7 +1088,21 @@ if __name__ == "__main__":
                 os.path.join(args.output_path, f"{frame}.png".rjust(8, "0")),
                 255 * cv2_img,
             )
+            if cluster_mask_dir is not None:
+                cluster_mask = render_cluster_mask_image(
+                    rasterize,
+                    pos,
+                    opacity,
+                    cov3D,
+                    mpm_cluster_ids,
+                )
+                save_tensor_image_bgr(
+                    cluster_mask,
+                    os.path.join(cluster_mask_dir, f"initial_{frame:04d}.png"),
+                )
     save_video(args.output_path, os.path.join(args.output_path, 'initial_render.mp4'))
+    if "cluster_mask" in locals():
+        del cluster_mask
     del pos, cov3D, rot, rendering, raddi, colors_precomp, rasterize, current_camera
     cleanup()
 
@@ -799,6 +1111,7 @@ if __name__ == "__main__":
         loss_value = 0.
         img_list = []
         tape.reset()
+        broadcast_cluster_params(mpm_solver, cluster_params, mpm_cluster_ids, device)
         with tape:
             mpm_solver.finalize_mu_lam()
 
@@ -925,7 +1238,8 @@ if __name__ == "__main__":
                 colors_precomp = convert_SH(shs, current_camera, gaussians, pos, rot)
                 colors_precomp = torch.nan_to_num(colors_precomp)
                 try:
-                    rendering, raddi = rasterize(
+                    rendering, raddi = rasterize_render_and_radii(
+                        rasterize,
                         means3D=pos,
                         means2D=pos,
                         shs=None,
@@ -952,7 +1266,8 @@ if __name__ == "__main__":
                     colors_precomp = convert_SH(shs, current_camera, gaussians, pos, rot)
                     colors_precomp = torch.nan_to_num(colors_precomp)
                     try:
-                        rendering, raddi = rasterize(
+                        rendering, raddi = rasterize_render_and_radii(
+                            rasterize,
                             means3D=pos,
                             means2D=pos,
                             shs=None,
@@ -983,7 +1298,8 @@ if __name__ == "__main__":
                 "Restoring last stable parameters and resetting MPM state.",
                 "red",
             )
-            restore_mpm_params(mpm_solver, last_stable_mpm_params, device)
+            restore_cluster_params(cluster_params, last_stable_cluster_params)
+            broadcast_cluster_params(mpm_solver, cluster_params, mpm_cluster_ids, device)
             mpm_solver.reset_pos_from_torch(mpm_init_pos, mpm_init_vol, mpm_init_cov)
             tape.reset()
             del img_list
@@ -1000,17 +1316,17 @@ if __name__ == "__main__":
             cleanup()
             continue
 	        
-        # save image
-        path = "./tmp_imgs/"
-        if not os.path.exists(path):
-            os.makedirs(path)
-        for i in range(len(img_list)):
-            cv2_img = img_list[i].permute(1, 2, 0).detach().cpu().numpy()
-            cv2_img = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB)
-            cv2.imwrite(
-                os.path.join(path, f"{frame}_{i}.png".rjust(8, "0")),
-                255 * cv2_img,
-            )
+        # # save image
+        # path = "./tmp_imgs/"
+        # if not os.path.exists(path):
+        #     os.makedirs(path)
+        # for i in range(len(img_list)):
+        #     cv2_img = img_list[i].permute(1, 2, 0).detach().cpu().numpy()
+        #     cv2_img = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB)
+        #     cv2.imwrite(
+        #         os.path.join(path, f"{frame}_{i}.png".rjust(8, "0")),
+        #         255 * cv2_img,
+        #     )
 
         
         loss = 0.
@@ -1127,51 +1443,37 @@ if __name__ == "__main__":
         if len(usable_raw_grads) > 0 and not update_allowed:
             cprint(
                 "WARNING: non-finite MPM parameter gradients detected. "
-                "Restoring the last stable MPM parameters and skipping this epoch's parameter update.",
+                "Restoring the last stable cluster parameters and skipping this epoch's parameter update.",
                 "red",
             )
-            restore_mpm_params(mpm_solver, last_stable_mpm_params, device)
+            restore_cluster_params(cluster_params, last_stable_cluster_params)
+            broadcast_cluster_params(mpm_solver, cluster_params, mpm_cluster_ids, device)
         elif update_allowed:
-            last_stable_mpm_params = snapshot_mpm_params(mpm_solver)
+            last_stable_cluster_params = snapshot_cluster_params(cluster_params)
 
-        grad_E = raw_grad_E
-        grad_E = normalize_param_grad(grad_E)
-        E_lower, E_upper = get_parameter_clip_bounds(material_params, "E")
-        if update_allowed and should_optimize_param(material_params, "E") and usable_raw_grads.get("E", False):
-            wp.launch(update_param, mpm_solver.n_particles, [mpm_solver.mpm_model.E, wp.from_torch(grad_E), get_param_lr(material_params, "E"), E_upper, E_lower])
-
-        grad_nu = raw_grad_nu
-        grad_nu = normalize_param_grad(grad_nu)
-        nu_lower, nu_upper = get_nu_clip_bounds(material_params)
-        if update_allowed and should_optimize_param(material_params, "nu") and usable_raw_grads.get("nu", False):
-            wp.launch(update_param_linear, mpm_solver.n_particles, [mpm_solver.mpm_model.nu, wp.from_torch(grad_nu), get_param_lr(material_params, "nu"), nu_lower, nu_upper])
-        
-        # add
-        grad_mu_N = raw_grad_mu_N
-        grad_mu_N = normalize_param_grad(grad_mu_N)
-        mu_N_lower, mu_N_upper = get_parameter_clip_bounds(material_params, "mu_N")
-        if update_allowed and should_optimize_param(material_params, "mu_N") and usable_raw_grads.get("mu_N", False):
-            wp.launch(update_param, mpm_solver.n_particles, [mpm_solver.mpm_model.mu_N, wp.from_torch(grad_mu_N), get_param_lr(material_params, "mu_N"), mu_N_upper, mu_N_lower])
-        
-        grad_lam_N = raw_grad_lam_N
-        grad_lam_N = normalize_param_grad(grad_lam_N)
-        lam_N_lower, lam_N_upper = get_parameter_clip_bounds(material_params, "lam_N")
-        if update_allowed and should_optimize_param(material_params, "lam_N") and usable_raw_grads.get("lam_N", False):
-            wp.launch(update_param, mpm_solver.n_particles, [mpm_solver.mpm_model.lam_N, wp.from_torch(grad_lam_N), get_param_lr(material_params, "lam_N"), lam_N_upper, lam_N_lower])
-        
-        grad_viscosity = raw_grad_viscosity
-        grad_viscosity = normalize_param_grad(grad_viscosity)
-        viscosity_lower, viscosity_upper = get_parameter_clip_bounds(material_params, "viscosity")
-        if update_allowed and should_optimize_param(material_params, "viscosity") and usable_raw_grads.get("viscosity", False):
-            wp.launch(update_param, mpm_solver.n_particles, [mpm_solver.mpm_model.viscosity, wp.from_torch(grad_viscosity), get_param_lr(material_params, "viscosity"), viscosity_upper, viscosity_lower])
-        
+        cluster_grads = {
+            "E": aggregate_cluster_grad(raw_grad_E, mpm_cluster_ids, cluster_k),
+            "nu": aggregate_cluster_grad(raw_grad_nu, mpm_cluster_ids, cluster_k),
+            "mu_N": aggregate_cluster_grad(raw_grad_mu_N, mpm_cluster_ids, cluster_k),
+            "lam_N": aggregate_cluster_grad(raw_grad_lam_N, mpm_cluster_ids, cluster_k),
+            "viscosity": aggregate_cluster_grad(raw_grad_viscosity, mpm_cluster_ids, cluster_k),
+        }
+        normalized_cluster_grads = {
+            name: normalize_param_grad(grad)
+            for name, grad in cluster_grads.items()
+        }
+        if update_allowed:
+            for name, grad in cluster_grads.items():
+                if usable_raw_grads.get(name, False):
+                    update_cluster_param(material_params, cluster_params, name, grad)
+        broadcast_cluster_params(mpm_solver, cluster_params, mpm_cluster_ids, device)
 
         cprint("The mean value of the gradients: ", "yellow")
-        print("grad_E: ", torch.mean(grad_E).item())
-        print("grad_nu: ", torch.mean(grad_nu).item())
-        print("grad_mu_N: ", torch.mean(grad_mu_N).item())
-        print("grad_lam_N: ", torch.mean(grad_lam_N).item())
-        print("grad_viscosity: ", torch.mean(grad_viscosity).item())
+        print("cluster_grad_E: ", torch.mean(normalized_cluster_grads["E"]).item())
+        print("cluster_grad_nu: ", torch.mean(normalized_cluster_grads["nu"]).item())
+        print("cluster_grad_mu_N: ", torch.mean(normalized_cluster_grads["mu_N"]).item())
+        print("cluster_grad_lam_N: ", torch.mean(normalized_cluster_grads["lam_N"]).item())
+        print("cluster_grad_viscosity: ", torch.mean(normalized_cluster_grads["viscosity"]).item())
         
         cprint("The mean value of the parameters after update: ", "yellow")        
         print("E: ", torch.mean(wp.to_torch(mpm_solver.mpm_model.E)).item())
@@ -1179,6 +1481,7 @@ if __name__ == "__main__":
         print("mu_N: ", torch.mean(wp.to_torch(mpm_solver.mpm_model.mu_N)).item())
         print("lam_N: ", torch.mean(wp.to_torch(mpm_solver.mpm_model.lam_N)).item())
         print("viscosity: ", torch.mean(wp.to_torch(mpm_solver.mpm_model.viscosity)).item())
+        print_cluster_summary(cluster_params, material_params)
 
 
         cprint(f"Updating MPM parameters", "green")
@@ -1190,10 +1493,11 @@ if __name__ == "__main__":
         del grad_x_wp, grad_cov_wp, grad_r_wp
         del raw_grad_E, raw_grad_nu, raw_grad_mu_N, raw_grad_lam_N, raw_grad_viscosity
         del missing_state_grads, optimized_raw_grads, usable_raw_grads, update_allowed
-        del grad_E, grad_nu, grad_mu_N, grad_lam_N, grad_viscosity
+        del cluster_grads, normalized_cluster_grads
         del particle_x, particle_cov, particle_R, pos, cov3D, rot, rendering, raddi, colors_precomp, rasterize, current_camera
         cleanup()
         if batch % 2 == 0:
+            broadcast_cluster_params(mpm_solver, cluster_params, mpm_cluster_ids, device)
             mpm_solver.finalize_mu_lam()
             with torch.no_grad():
                 for frame in tqdm(range(stage_num * frame_per_stage)):
@@ -1249,7 +1553,8 @@ if __name__ == "__main__":
                         shs = torch.cat([shs_render, unselected_shs], dim=0)
 
                     colors_precomp = convert_SH(shs, current_camera, gaussians, pos, rot)
-                    rendering, raddi = rasterize(
+                    rendering, raddi = rasterize_render_and_radii(
+                        rasterize,
                         means3D=pos,
                         means2D=init_screen_points,
                         shs=None,
@@ -1270,6 +1575,20 @@ if __name__ == "__main__":
                         os.path.join(args.output_path, f"{frame}.png".rjust(8, "0")),
                         255 * cv2_img,
                     )
+                    if cluster_mask_dir is not None:
+                        cluster_mask = render_cluster_mask_image(
+                            rasterize,
+                            pos,
+                            opacity,
+                            cov3D,
+                            mpm_cluster_ids,
+                        )
+                        save_tensor_image_bgr(
+                            cluster_mask,
+                            os.path.join(cluster_mask_dir, f"batch_{batch:02d}_{frame:04d}.png"),
+                        )
             save_video(args.output_path, os.path.join(args.output_path, 'video%02d.mp4' % batch))
+            if "cluster_mask" in locals():
+                del cluster_mask
             del pos, cov3D, rot, rendering, raddi, colors_precomp, rasterize, current_camera
             cleanup()

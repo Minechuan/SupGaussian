@@ -1,0 +1,84 @@
+{
+    "opacity_threshold": 0.005,
+    "rotation_degree": [],
+    "rotation_axis": [],
+    "substep_dt": 5e-05,
+    "frame_dt": 0.02,
+    "frame_num": 100,
+    "nu": 0.35,
+    "E": 3,
+    "mu_N": 2,
+    "lam_N": 1,
+    "viscosity": 10,
+    "parameter_clip": {
+        "E": {"lower": -2.0, "upper": 2.0},
+        "nu": {"lower": 0.001, "upper": 0.45},
+        "mu_N": {"lower": -1.0, "upper": 5.0},
+        "lam_N": {"lower": -1.0, "upper": 5.0},
+        "viscosity": {"lower": -1.0, "upper": 2.0}
+    },
+    "param_lr": {
+        "E": 0.1,
+        "nu": 0.01,
+        "mu_N": 0.1,
+        "lam_N": 0.1,
+        "viscosity": 0.1
+    },
+    "param": ["E", "nu", "viscosity"],
+    "material": "jelly",
+    "density": 700,
+    "g": [
+        0,
+        0,
+        -9.8
+    ],
+    "grid_v_damping_scale": 0.999,
+    "rpic_damping": 0.01,
+    "grid_lim": 2.5,
+    "n_grid": 64,
+    "boundary_conditions": [
+        {
+            "type": "cuboid",
+            "point": [
+                1.0,
+                1.0,
+                0.15
+            ],
+            "size": [
+                1.5,
+                1.5,
+                0.1
+            ],
+            "velocity": [
+                0,
+                0,
+                0
+            ],
+            "start_time": 0,
+            "end_time": 1000.0,
+            "reset": 1
+        },
+        {
+            "type": "bounding_box"
+        }
+    ],
+    "mpm_space_vertical_upward_axis": [
+        0,
+        0,
+        1
+    ],
+    "mpm_space_viewpoint_center": [
+        1.0,
+        1.0,
+        1.0
+    ],
+    "default_camera_index": -1,
+    "show_hint": false,
+    "init_azimuthm": -36.7,
+    "init_elevation": 8.96,
+    "init_radius": 4.11,
+    "move_camera": true,
+    "delta_a": 1.2,
+    "delta_e": 0.0,
+    "delta_r": 0.0
+}
