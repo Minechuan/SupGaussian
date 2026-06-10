@@ -85,6 +85,16 @@ nrm  = (Fp.inverse().transpose() @ dir).normalized()   # 法线用 F^{-T}
 
 **材质与场景切换**：数字键 `1`–`9` 实时切换九种材质预设（jelly / rubber / putty / snow / liquid / plasticine / metal / sand / foam），调用 `apply_preset()` 即时改写杨氏模量、泊松比、屈服强度等参数；字母键 `B/X/M/C/T` 切换五种程序生成场景（球 / 方块 / 双球 / 圆柱 / 圆环）。ImGui 面板提供等价的按钮和 `Young E` / `Poisson` 滑条，避免键盘焦点被面板抢占的问题。
 
+<table>
+  <tr>
+    <td><img src="./report_assets/2_panel_jelly.png" alt="interactive panel" width="520"></td>
+  </tr>
+  <tr>
+    <td align="center">交互窗口：左侧 ImGui 面板（材质按钮、Young E / Poisson / gravity 等滑条、场景信息），右侧为下落中的 jelly 球（点渲染模式）。</td>
+  </tr>
+</table>
+
+
 **外力与碰撞交互**：
 
 | 交互 | 操作 | 实现 |
@@ -101,6 +111,17 @@ nrm  = (Fp.inverse().transpose() @ dir).normalized()   # 法线用 F^{-T}
 #### B6. Demo 展示
 
 支持加载真实 3DGS 重建的 `.ply` 点云（如 `chair`），由 `gs_loader.py` 解析并归一化到仿真空间后直接仿真；CUDA 后端可跑满约 27 万高斯。物体在重力下落地、与地面/障碍物碰撞、产生材质相关的形变，全程物理真实计算。服务器端用 `--headless` 模式离线模拟并逐帧渲染为 PNG，再用 ffmpeg 合成 mp4。
+
+<table>
+  <tr>
+    <td><img src="./report_assets/2_chair_obstacle.png" alt="chair on obstacle"></td>
+    <td><img src="./report_assets/2_ball_obstacle.png" alt="ball on obstacle"></td>
+  </tr>
+  <tr>
+    <td align="center">真实 3DGS 椅子点云落在球形障碍物上，被撑起并沿表面下垂、产生形变。</td>
+    <td align="center">程序生成球与球形碰撞代理（金黄）接触，接触处被挤压变形。</td>
+  </tr>
+</table>
 
 演示视频（见 `report_assets/` 下对应 mp4）涵盖以下几组效果：
 
