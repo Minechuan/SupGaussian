@@ -1,0 +1,40 @@
+# Output directories
+**/output/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Large model files
+**/sam_vit_*.pth
+
+# Dataset files (too large)
+nerf_synthetic/
+nerf_synthetic.zip
+
+# External repos
+PhysGaussian/
+
+# Archives
+*.zip
+
+# Generated files
+**/inferred_materials.json
+**/train_output.log
+
+# Misc
+example/
+model/
+photo/
+env.txt
+build_ppt.py
+当前任务.md
+**/mask_vis/
+report.md
+
+
+running/sam_vit_b.pth
+*.pth
+*.pt
+*.ply
