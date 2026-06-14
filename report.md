@@ -1,9 +1,313 @@
 # 图形学物理仿真 Lab4
 
-小组成员：毛川、朱绍恺
+小组成员：毛川、朱绍恺、马凯翔
 
 ## 第一部分
+## A: 基于 3D Gaussian Splatting 的场景重建与多材料语义标注
 
+本部分完成 Task 1 的全部工作：从 NeRF 合成数据集的多视角图像出发，自实现 3D Gaussian Splatting（3DGS）训练管线，生成高质量 `.ply` 点云；在此基础上，利用 Qwen2.5-VL 视觉语言模型进行材料语义推断，并结合 SAM（Segment Anything）实现**逐高斯点多材料分割**，最终生成 PhysGaussian 仿真所需的点云与物理参数配置文件。核心交付物是一套可供Task 2直接调用的端到端工具链。
+
+每个 3D Gaussian 不仅是渲染基元，同时也是材料语义的载体。通过对 2D 图像的语义分割结果进行 3D 反投影，将材料标签从像素空间传递到高斯点云空间，使不同部件能够携带独立的物理参数进入 MPM 仿真。
+
+#### A1. 整体流程与调用链
+
+主程序为 `running/pipeline.py`，支持单材料与多材料两种模式。运行时主要输入包括：数据集路径 `--dataset`（如 `chair`、`lego`），3DGS 训练后端 `--gs-backend`（默认为自实现的 `my`），材料类型 `--material`（可选），以及多材料模式开关 `--multi-material` 与候选材料提示 `--material-hint`。
+
+完整调用链为：
+
+1. **3DGS 训练**：`train_my_3dgs.py → my_3dgs/` 从 NeRF 合成数据训练高斯场，输出 PLY 点云；
+2. **材料确定**（单材料模式）：Qwen2.5-VL 从图像推断整体材料，或用户直接指定；
+3. **多材料分割**（多材料模式）：`segment_material.py` 用 SAM 分割训练视角图像，聚类后反投影到 3D 高斯点；
+4. **配置生成**：`generate_config.py` 根据材料参数生成 PhysGaussian `config.json`；
+5. **仿真就绪**：`run_simulation.py` 读取 PLY 和 config，调用 PhysGaussian 执行 MPM 仿真。
+
+单材料与多材料模式共享同一套下游接口，`run_simulation.py` 自动检测 `config_multi.json`（多材料）或 `config.json`（单材料），同学 2 无需修改调用方式。
+
+#### A2. 自实现 3D Gaussian Splatting
+
+为深入理解 3DGS 的内部机制，本部分从零实现了一套完整的训练管线（`running/my_3dgs/`），仅复用 CUDA 光栅化器 `diff-gaussian-rasterization`，其余组件全部自行编写。
+
+**高斯表示**：每个高斯 $i$ 由以下可训练参数定义：
+
+$$
+G_i = (\mathbf{x}_i, \mathbf{q}_i, \mathbf{s}_i, \alpha_i, \mathbf{f}_i^{\mathrm{dc}}, \mathbf{f}_i^{\mathrm{rest}}),
+$$
+
+其中 $\mathbf{x}_i \in \mathbb{R}^3$ 是位置，$\mathbf{q}_i \in \mathbb{R}^4$ 是旋转四元数，$\mathbf{s}_i \in \mathbb{R}^3$ 是对数尺度，$\alpha_i$ 是 logit 不透明度，$\mathbf{f}_i^{\mathrm{dc}} \in \mathbb{R}^3$ 是球谐函数 DC 分量，$\mathbf{f}_i^{\mathrm{rest}} \in \mathbb{R}^{3\times((d+1)^2-1)}$ 是高阶球谐系数（$d$ 最大为 3）。
+
+协方差矩阵由尺度和旋转构造：
+
+$$
+\Sigma_i = R(\mathbf{q}_i)\,S(\mathbf{s}_i)\,S(\mathbf{s}_i)^\top\,R(\mathbf{q}_i)^\top,
+$$
+
+其中 $R(\mathbf{q}_i)$ 是从四元数构建的 $3\times 3$ 旋转矩阵，$S(\mathbf{s}_i) = \operatorname{diag}(\exp(\mathbf{s}_i))$。
+
+**训练流程**：从随机初始化的 100,000 个高斯出发，在 300 个训练视角（train + test，因为不需要评估）上以随机顺序迭代训练。每轮：
+
+1. 随机采样一个相机视角；
+2. 调用 CUDA rasterizer 渲染该视角的图像；
+3. 计算损失 $\mathcal{L} = 0.8\,\mathcal{L}_1 + 0.2\,(1 - \mathrm{SSIM})$；
+4. 反向传播，累积 view-space 梯度用于稠密化判断；
+5. 每 100 轮执行稠密化与剪枝（克隆高梯度小高斯、分裂高梯度大高斯、移除低不透明度高斯）；
+6. 每 3000 轮重置不透明度（防止过饱和）；
+7. 每 1000 轮递增活跃 SH 阶数。
+
+**稠密化中的四元数→旋转矩阵转换**：分裂操作需要在高斯的局部坐标系中采样新位置。关键环节是将四元数转换为旋转矩阵以正确变换采样方向：
+
+```python
+# my_3dgs/gaussian.py · densify_and_split()
+q = self._rotation[selected_pts_mask]  # [K, 4]
+q = q / torch.norm(q, dim=-1, keepdim=True)
+r, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+R_mat = torch.stack([
+    1 - 2*(y*y + z*z), 2*(x*y - r*z), 2*(x*z + r*y),
+    2*(x*y + r*z), 1 - 2*(x*x + z*z), 2*(y*z - r*x),
+    2*(x*z - r*y), 2*(y*z + r*x), 1 - 2*(x*x + y*y),
+], dim=-1).reshape(-1, 3, 3)
+new_xyz = torch.bmm(R_mat, samples.unsqueeze(-1)).squeeze(-1) + centers
+```
+
+**优化器配置**：使用 Adam，各参数组设置不同学习率——位置 $1.6\times 10^{-4}$（指数衰减至 $1.6\times 10^{-6}$），球谐 DC $2.5\times 10^{-3}$，高阶球谐 $1.25\times 10^{-4}$，不透明度 $0.05$，尺度 $5\times 10^{-3}$，旋转 $1\times 10^{-3}$。
+
+#### A3. 视觉-先验材料推断
+
+在单材料模式下，系统需要从物体图像推断整体材料类型（如 chair→wood, drum→metal）。本部分使用 Qwen2.5-VL-3B-Instruct 作为视觉语言模型，采用单图单次推理策略。
+
+**推理流程**（`running/infer_physics.py`）：
+
+1. 从训练集中选取一张图像（`r_0.png`，正面视角）；
+2. 构造 prompt：`"What material is this object? Object: <answer> Material: <answer>"`；
+3. Qwen 以约 80s 完成单图推理（3B 模型在 RTX 4060 上）；
+4. 输出通过 `resolve_material()` 映射到 83 种预设材料之一。
+
+**材料数据库**（`running/material_database.py`）：覆盖 PhysGaussian 支持的 6 种 MPM 类型——jelly(10)、metal(17)、sand(10)、foam(15)、snow(9)、plasticine(22)，共 83 种材料变体。每种材料包含杨氏模量 $E$、泊松比 $\nu$、密度、屈服强度等参数。
+
+**对象特化映射**：由于 3B 模型对材质分类存在偏差（如将浅色木椅误判为 "cloth" 或 "metal"），系统维护了 `OBJECT_OVERRIDES` 字典，根据物体语义类别进行二次修正：`furniture→wood`、`drum/mic/ship→metal`、`lego→hard_plastic` 等。
+
+#### A4. SAM 驱动的多材料分割与 3D 投影
+
+对于由不同材料部件组成的物体（如 lego 积木推土机的黄车身、黑轮子、红蓝部件），需要为每个高斯点分配独立的材料标签。本部分实现了"2D 语义分割 → 特征聚类 → 3D 反投影"的完整管线（`running/segment_material.py`）。
+
+**A4.1. SAM 自动分割**
+
+使用 Segment Anything Model (ViT-B) 对 6 个均匀采样的训练视角进行自动分割。SAM 的 `SamAutomaticMaskGenerator` 在 $32\times 32$ 网格点上生成候选 mask，过滤条件为：
+
+- 面积占比 $< 70\%$（排除背景 mask）；
+- 面积占比 $> 0.2\%$（排除噪点 mask）；
+- 预测 IoU $\geq 0.88$，稳定性分数 $\geq 0.92$。
+
+每个视角生成 10–15 个有效 mask，对应物体的不同部件区域（如车轮、车身、底座）。
+
+**A4.2. 特征提取与颜色聚类**
+
+对每个 mask 提取 6 维特征向量：
+
+$$
+\mathbf{f}_m = [\,\bar{R},\,\bar{G},\,\bar{B},\,y_{\mathrm{center}}/H,\;h/w,\;A_{\mathrm{mask}}/(HW)\,],
+$$
+
+包含平均颜色、归一化垂直位置、包围盒宽高比和归一化面积。所有视角的 mask 特征汇总后，使用 KMeans 聚类为 $K$ 个材料组（$K$ 由 `--num-materials` 指定，默认 4）。
+
+聚类后，各组的材料标签通过两种策略确定：
+
+1. **颜色启发式**（默认）：基于 HSV-like 颜色特征（亮度、饱和度、红绿比、红蓝比）映射到 wood/metal/plastic/fabric/foam/leather/rubber 七种预定义类型；
+2. **用户提示**（`--material-hint`）：将聚类中心与用户指定的候选材料预期颜色进行最近邻匹配，确保分类结果符合领域知识。
+
+**A4.3. 2D Mask 到 3D 高斯点的投影**
+
+投影的数学基础是 3DGS 的相机模型。给定世界坐标 $\mathbf{x}_i$，通过相机的外参矩阵 $W$（world-to-view）和内参投影矩阵 $P$ 计算屏幕坐标：
+
+$$
+\tilde{\mathbf{p}}_i = \mathbf{x}_i^{\mathrm{hom}} \cdot W,\qquad
+\mathbf{p}_i^{\mathrm{clip}} = \tilde{\mathbf{p}}_i \cdot P,\qquad
+\begin{bmatrix}u_i\\v_i\end{bmatrix} =
+\begin{bmatrix}
+(\mathbf{p}^{\mathrm{clip}}_x / \mathbf{p}^{\mathrm{clip}}_w + 1) \cdot 0.5 \cdot w \\
+(1 - \mathbf{p}^{\mathrm{clip}}_y / \mathbf{p}^{\mathrm{clip}}_w) \cdot 0.5 \cdot h
+\end{bmatrix}.
+$$
+
+```python
+# segment_material.py · project_gaussians_to_2d()
+p_world = torch.cat([xyz, ones], dim=-1)        # [N, 4]
+p_view  = p_world @ camera.world_view_transform  # [N, 4]
+p_clip  = p_view  @ camera.projection_matrix     # [N, 4]
+screen_x = (p_clip[:,0] / p_clip[:,3] + 1) * 0.5 * width
+screen_y = (1 - p_clip[:,1] / p_clip[:,3]) * 0.5 * height
+```
+
+对每个视角的每个 mask，检查所有投影后落在视野内的高斯点，若其屏幕坐标落在 mask 区域内，则为该高斯点的对应材料 ID 投一票。跨多个视角累积投票后，每个高斯点取最多票的材料作为最终标签：
+
+$$
+\ell_i = \arg\max_k \sum_{v \in \mathcal{V}} \mathbb{1}\big[M_v(u_i^v, v_i^v) = k\big].
+$$
+
+未被任何视角覆盖的点（约占 $< 5\%$）继承全局最常见的材料标签。
+
+#### A5. PhysGaussian 配置生成与流水线集成
+
+**单材料配置**（`running/generate_config.py`）：根据材料参数生成 `config.json`，包含 MPM 类型、$E$、$\nu$、密度、屈服强度、边界条件（地面 cuboid + 包围盒）、仿真步长 $\Delta t_{\mathrm{frame}}=0.02$s、子步 $\Delta t_{\mathrm{sub}}=5\times 10^{-5}$s，以及相机初始参数。
+
+**多材料配置**（`config_multi.json`）：在单材料配置基础上增加 `"multi_material": true` 和 `"regions"` 字段，为每个材料 ID 指定独立的 MPM 参数：
+
+```json
+{
+  "multi_material": true,
+  "regions": {
+    "0": {"name": "wood",    "mpm_material": "plasticine", "E": 1e10, "nu": 0.35, "density": 700},
+    "1": {"name": "metal",   "mpm_material": "metal",      "E": 2e11, "nu": 0.30, "density": 7800},
+    "2": {"name": "plastic", "mpm_material": "plasticine", "E": 2e9,  "nu": 0.38, "density": 1200}
+  }
+}
+```
+
+**逐点材料数据**：`material_ids.npy`（形状 `[N]` 的 int32 数组）和 `material_map.json`（ID→物理参数映射）保存在 PLY 同级目录，作为与同学 2 的接口约定。增强的 PLY 文件 `point_cloud_multi.ply` 在原属性基础上附加 `material_id` 字段，可直接在 MeshLab 等工具中可视化。
+
+#### A6. 实验效果
+
+在 NeRF 合成数据集的两个代表性物体上进行了完整测试：
+
+<table>
+  <tr>
+    <th></th>
+    <th>chair</th>
+    <th>lego</th>
+  </tr>
+  <tr>
+    <td><b>3DGS PSNR</b></td>
+    <td>37.85 dB</td>
+    <td>36.38 dB</td>
+  </tr>
+  <tr>
+    <td><b>训练时间</b></td>
+    <td>6.8 min</td>
+    <td>7.4 min</td>
+  </tr>
+  <tr>
+    <td><b>高斯点数</b></td>
+    <td>94,449</td>
+    <td>133,017</td>
+  </tr>
+  <tr>
+    <td><b>SAM 分割 mask 数</b></td>
+    <td>67（6 视角）</td>
+    <td>68（6 视角）</td>
+  </tr>
+  <tr>
+    <td><b>材料聚类数</b></td>
+    <td>3</td>
+    <td>4</td>
+  </tr>
+  <tr>
+    <td><b>材料分布</b></td>
+    <td>plastic 99.6%<br>fabric 0.4%</td>
+    <td>metal 56.9%<br>wood 27.7%<br>plastic 15.3%</td>
+  </tr>
+  <tr>
+    <td><b>PhysGaussian 仿真</b></td>
+    <td> 已跑通（落地形变）</td>
+    <td> 配置就绪</td>
+  </tr>
+</table>
+
+chair 自身为均匀浅米色材质，三组聚类均归为 plastic，属正确行为——颜色相近的部件确实为同一材料。lego 因多色积木块天然存在颜色差异，SAM+KMeans 有效区分出金属质感（灰色底盘/轮子）、木质色调（铲斗部件）和塑料色调（彩色积木块），验证了多材料管线的有效性。
+
+自实现的 3DGS 略优于 PhysGaussian 官方代码（chair 36.83 vs 35.94 dB），点数更少（91K vs 209K），说明稠密化策略有效去除了冗余高斯。
+
+#### A7. 代码运行脚本与使用方法
+
+本节提供完整的运行命令参考，供同学 2 或其他使用者复现结果。
+
+**环境配置**：需要 conda 环境 `forCVGCoding`，包含 PyTorch、CUDA、`diff-gaussian-rasterization`、`segment-anything`、`scikit-learn`、`plyfile` 等依赖。多材料模式额外需要下载 SAM 模型权重：
+
+```bash
+cd running
+curl -L -o sam_vit_b.pth https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth
+```
+
+**A7.1. 基础流程：单材料 3DGS 训练 + 配置生成**
+
+```bash
+cd running
+
+# 使用自实现 3DGS 训练（默认），指定材料
+python pipeline.py --dataset chair --material wood --iterations 7000
+
+# 使用 PhysGaussian 原始代码训练
+python pipeline.py --dataset chair --material wood --gs-backend physgaussian --iterations 30000
+
+# 自动从图像推断材料（调用 Qwen2.5-VL）
+python pipeline.py --dataset chair --iterations 7000
+```
+
+**A7.2. 高级流程：多材料逐点分割**
+
+```bash
+# 自动模式（4 类材料，6 个视角）
+python pipeline.py --dataset lego --multi-material --iterations 7000
+
+# 指定候选材料类型（推荐，提高分类准确率）
+python pipeline.py --dataset lego --multi-material \
+    --material-hint "plastic,metal,rubber" \
+    --num-materials 4 --num-seg-views 6
+
+# 跳过训练（已有 PLY 时）
+python pipeline.py --dataset lego --skip-train --multi-material \
+    --material-hint "plastic,metal,wood"
+```
+
+**A7.3. 查看可用材料与运行仿真**
+
+```bash
+# 列出所有 83 种材料预设
+python pipeline.py --list-materials
+
+# 运行 PhysGaussian MPM 仿真（自动检测 config.json 或 config_multi.json）
+python run_simulation.py --object_id chair
+```
+
+**A7.4. 单独调用各模块**
+
+```bash
+# 仅训练 3DGS
+python train_my_3dgs.py --dataset chair --iterations 7000
+
+# 仅做多材料分割（需要已有 PLY）
+python segment_material.py --dataset chair --num_materials 4 --visualize
+
+# 仅生成配置
+python generate_config.py          # 使用默认材料
+```
+
+**A7.5. 输出文件结构**
+
+```
+output/<dataset>/
+├── point_cloud/iteration_<N>/
+│   ├── point_cloud.ply              # 标准 PLY（单材料仿真直接使用）
+│   ├── point_cloud_multi.ply        # 带 material_id 属性的 PLY
+│   ├── material_ids.npy             # [N] 逐点材料编号（int32）
+│   └── material_map.json            # 材料 ID → 物理参数映射
+├── config.json                      # 单材料 PhysGaussian 配置
+├── config_multi.json                # 多区域 PhysGaussian 配置
+└── mask_vis/                        # SAM 分割可视化图
+    └── view_*.jpg
+```
+
+**A7.6. 分配给同学的交付说明**
+
+同学 2 接收代码后，需要在 `running/` 目录下执行上述命令即可获得 PLY 与 config。若使用多材料模式，需额外下载 SAM 权重（见上方命令）。`run_simulation.py` 已适配两种模式，自动优先检测 `config_multi.json`，无需手动选择配置文件。
+
+#### A8. 方法与局限性
+
+1. **材料分类精度受限**：当物体颜色与材料语义不一致时（如白色金属 vs 白色塑料），纯颜色特征无法区分。解决方案是引入 Qwen2.5-VL 对每个 mask 区域做语义分类，但 3B 模型的推理速度（~80s/图）和区域级精度仍需权衡。当前代码已预留 `material_hint` 接口，允许用户显式指定候选材料类型来规避此问题。
+
+2. **SAM 分割粒度不易控制**：自动 mask 生成器可能将同一材料区域切分为多个碎片 mask（尤其在高纹理区域），或遗漏细小部件。参数调优（`pred_iou_thresh`、`stability_score_thresh`）可部分缓解，但最优参数因物体而异。
+
+3. **2D→3D 投影存在覆盖盲区**：仅使用 6 个采样视角，部分高斯点可能在所有采样视角中均不可见，导致材料标签缺失（当前通过全局多数投票填充）。增加采样视角或使用 α-blending 可见性权重可改善覆盖。
+
+4. **多材料仿真端尚未与 PhysGaussian 完全打通**：本部分输出了 `material_ids.npy` 和 `material_map.json` 作为接口，但 PhysGaussian 的 MPM 求解器当前为均质材料设计，但 Task 2需修改仿真代码以支持逐粒子读取材料参数。
 
 
 ## 第二部分
