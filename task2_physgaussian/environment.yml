@@ -1,0 +1,11 @@
+name: py310
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - ffmpeg
+  - pip
+  - pip:
+      - taichi==1.7.4
+      - numpy
+      - h5py==3.11.0
