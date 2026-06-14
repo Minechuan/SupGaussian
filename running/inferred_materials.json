@@ -1,0 +1,72 @@
+{
+  "chair": {
+    "material_key": "wood",
+    "mpm_type": "plasticine",
+    "E": 10000000000.0,
+    "nu": 0.35,
+    "density": 700,
+    "yield_stress": 5000000.0
+  },
+  "drums": {
+    "material_key": "metal",
+    "mpm_type": "metal",
+    "E": 200000000000.0,
+    "nu": 0.3,
+    "density": 7800,
+    "yield_stress": 200000000.0,
+    "hardening": 5.0
+  },
+  "ficus": {
+    "material_key": "hard_plastic",
+    "mpm_type": "metal",
+    "E": 3000000000.0,
+    "nu": 0.38,
+    "density": 1200,
+    "yield_stress": 50000000.0,
+    "hardening": 2.0
+  },
+  "hotdog": {
+    "material_key": "bread",
+    "mpm_type": "foam",
+    "E": 100000.0,
+    "nu": 0.08,
+    "density": 200,
+    "yield_stress": 3000.0
+  },
+  "lego": {
+    "material_key": "hard_plastic",
+    "mpm_type": "metal",
+    "E": 3000000000.0,
+    "nu": 0.38,
+    "density": 1200,
+    "yield_stress": 50000000.0,
+    "hardening": 2.0
+  },
+  "materials": {
+    "material_key": "hard_plastic",
+    "mpm_type": "metal",
+    "E": 3000000000.0,
+    "nu": 0.38,
+    "density": 1200,
+    "yield_stress": 50000000.0,
+    "hardening": 2.0
+  },
+  "mic": {
+    "material_key": "metal",
+    "mpm_type": "metal",
+    "E": 200000000000.0,
+    "nu": 0.3,
+    "density": 7800,
+    "yield_stress": 200000000.0,
+    "hardening": 5.0
+  },
+  "ship": {
+    "material_key": "hard_plastic",
+    "mpm_type": "metal",
+    "E": 3000000000.0,
+    "nu": 0.38,
+    "density": 1200,
+    "yield_stress": 50000000.0,
+    "hardening": 2.0
+  }
+}
