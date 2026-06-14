@@ -23,6 +23,8 @@
 
 单材料与多材料模式共享同一套下游接口，`run_simulation.py` 自动检测 `config_multi.json`（多材料）或 `config.json`（单材料），同学 2 无需修改调用方式。
 
+**说明**：`--gs-backend` 参数可选择 `my`（自实现 3DGS，详见 A2 节）或 `physgaussian`（PhysGaussian 官方代码）。两套后端输出的 PLY 格式完全兼容，下游仿真模块无需任何修改，使用者可根据需要自由切换。
+
 #### A2. 自实现 3D Gaussian Splatting
 
 为深入理解 3DGS 的内部机制，本部分从零实现了一套完整的训练管线（`running/my_3dgs/`），仅复用 CUDA 光栅化器 `diff-gaussian-rasterization`，其余组件全部自行编写。
